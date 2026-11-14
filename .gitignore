@@ -1,0 +1,24 @@
+# ---- 构建与分发产物 ----
+/build/
+/dist/
+/out/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# ---- 第三方二进制 (FFmpeg 约 260MB, 不纳入仓库, 请按 README 自行放置) ----
+/third_party/ffmpeg*/
+
+# ---- IDE / 工具本地配置 ----
+.vscode/
+.idea/
+*.user
+.trae/
+.trae-html-share-packages/
+
+# ---- 系统 / 临时文件 ----
+Thumbs.db
+.DS_Store
+*.log
+*.tmp
+/minitest.cpp
