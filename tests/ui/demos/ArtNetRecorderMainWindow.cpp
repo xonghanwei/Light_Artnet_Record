@@ -846,7 +846,7 @@ void ArtNetRecorderMainWindow::setupContent() {
                 .arg(QString::fromLatin1(av_version_info()))
                 .arg(LIBAVCODEC_VERSION_MAJOR).arg(LIBAVFORMAT_VERSION_MAJOR));
 #else
-    logWarning(tr("未检测到 FFmpeg 解码库, 音视频时间码/波形不可用 (NO_FFMPEG)"));
+    appendLog(tr("未检测到 FFmpeg 解码库, 音视频时间码/波形不可用 (NO_FFMPEG)"), "warn");
 #endif
 
     // 配置持久化: 启动加载, 退出保存
