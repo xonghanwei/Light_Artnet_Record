@@ -3,9 +3,25 @@ name: Windows Build
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'dist/**'
   pull_request:
     branches: [main]
   workflow_dispatch:
+
+# 同一分支的新提交取消旧运行，避免排队浪费
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  QT_VERSION: '5.15.2'
+  BUILD_DIR: build
 
 jobs:
   build:
@@ -17,10 +33,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Qt 5.15.2
+      - name: Install Qt ${{ env.QT_VERSION }}
         uses: jurplel/install-qt-action@v4
         with:
-          version: '5.15.2'
+          version: ${{ env.QT_VERSION }}
           arch: win64_msvc2019_64
           cache: true
 
@@ -31,16 +47,60 @@ jobs:
 
       - name: Configure (CMake)
         run: >
-          cmake -S . -B build
+          cmake -S . -B ${{ env.BUILD_DIR }}
           -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DBUILD_TESTING=ON
 
       - name: Build
-        run: cmake --build build --parallel 4
+        run: cmake --build ${{ env.BUILD_DIR }} --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: SDK self-test
+        run: .\${{ env.BUILD_DIR }}\bin\artnet_sdk_test.exe
 
       - name: Test
-        working-directory: build
+        working-directory: ${{ env.BUILD_DIR }}
         # TestSyncClockIntegration 在 MSVC Release 下进程异常退出（无 QTest 断言输出），
         # 暂从门禁中排除，待单独排查；其余 10 个测试全部纳入。
-        run: ctest --output-on-failure --timeout 300 -E TestSyncClockIntegration
+        run: ctest --output-on-failure --timeout 300 --output-junit test-results.xml -E TestSyncClockIntegration
+
+      - name: Test summary
+        if: always()
+        shell: pwsh
+        run: |
+          $file = "${{ env.BUILD_DIR }}/test-results.xml"
+          if (-not (Test-Path $file)) {
+            "### 测试结果`n`n未生成测试报告（构建或测试未执行）" >> $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          [xml]$x = Get-Content $file
+          $suites = @($x.testsuites.testsuite)
+          $total = ($suites | Measure-Object -Property tests -Sum).Sum
+          $fail  = ($suites | Measure-Object -Property failures -Sum).Sum
+          $skip  = ($suites | Measure-Object -Property skipped -Sum).Sum
+          $time  = [math]::Round(($suites | Measure-Object -Property time -Sum).Sum, 1)
+          "### 测试结果`n" >> $env:GITHUB_STEP_SUMMARY
+          "| 总数 | 通过 | 失败 | 跳过 | 耗时 |" >> $env:GITHUB_STEP_SUMMARY
+          "|---|---|---|---|---|" >> $env:GITHUB_STEP_SUMMARY
+          "| $total | $($total - $fail - $skip) | $fail | $skip | ${time}s |" >> $env:GITHUB_STEP_SUMMARY
+          if ($fail -gt 0) {
+            "`n**失败用例**`n" >> $env:GITHUB_STEP_SUMMARY
+            foreach ($s in $suites) {
+              foreach ($c in @($s.testcase)) {
+                if ($c.failure) { "- ``$($c.name)``" >> $env:GITHUB_STEP_SUMMARY }
+              }
+            }
+          }
+
+      - name: Upload SDK artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: artnet-sdk-win64
+          path: |
+            ${{ env.BUILD_DIR }}/bin/artnet_sdk.dll
+            ${{ env.BUILD_DIR }}/bin/artnet_sdk.lib
+            ${{ env.BUILD_DIR }}/bin/artnet_recorder.exe
+            sdk/include/ArtNetSdk.h
+          if-no-files-found: warn
+          retention-days: 7
