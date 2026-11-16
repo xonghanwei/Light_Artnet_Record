@@ -536,18 +536,18 @@ private:
     void refreshD2aPorts();
     void startDmxToArt();
     void stopDmxToArt();
-    void onD2aSerialData(int row);
+    void onD2aGroupFrame(int slot, const QByteArray &dmx, qint64 arrivedUs);
     void convertDmxToArt(int row, const QByteArray &dmx);
 
     enum { kDmxToArtIns = 8 };
-    // 每路输入: 启用 + 串口 + 目标 Universe, 独立接收累积缓冲 / 帧计数 / ArtDmx 序号
+    // 每路输入: 启用 + 串口 + 目标 Universe; 串口读取/组帧在 DmxRxGroup worker 线程,
+    // GUI 只收完整帧 (帧计数 / ArtDmx 序号在帧回调里维护)
     struct DmxToArtInput {
         QCheckBox   *chkEnabled = nullptr;
         QComboBox   *cmbPort    = nullptr;
         QSpinBox    *spinUni    = nullptr;
         QLabel      *lblRx      = nullptr;
-        QSerialPort *serial     = nullptr;   // 未启动时为 nullptr
-        QByteArray   accum;
+        int          slot       = -1;         // DmxRxGroup 接收槽位 (-1 = 未启用/打开失败)
         quint64      rxCount    = 0;
         quint8       seq        = 0;
     };
@@ -567,6 +567,8 @@ private:
     QLabel      *m_lblD2aCh1     = nullptr;
     QUdpSocket  *m_d2aSocket     = nullptr;
     DmxToArtInput m_d2aIns[kDmxToArtIns];
+    DmxRxGroup   m_d2aGroup;                  // 每口独立 worker 线程接收 (组帧脱离 GUI 线程)
+    bool         m_d2aRxConnected = false;    // frameReady 只连接一次
     QByteArray   m_d2aLastDmx;
     quint64      m_d2aTxCount    = 0;
     quint64      m_d2aDropCount  = 0;

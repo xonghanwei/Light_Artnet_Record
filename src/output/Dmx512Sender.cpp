@@ -487,3 +487,153 @@ quint64 DmxSyncGroup::nowUs() {
     return quint64(ts.tv_sec) * 1000000ull + quint64(ts.tv_nsec) / 1000ull;
 #endif
 }
+
+// ============================================================
+// DmxRxGroup — 多端口 DMX512 接收线程组
+// ============================================================
+#include <QSerialPort>
+#include <QDateTime>
+#include <functional>
+
+// 单端口接收 worker: 线程内创建 QSerialPort 并阻塞式 waitForReadyRead 循环组帧,
+// 完整帧经 frameReady 队列信号送 GUI; 高频字节读取与帧对齐不占用主线程
+class DmxRxGroup::Impl : public QThread {
+public:
+    // sink 在 worker 线程被调用; 由 DmxRxGroup 传入 (内部 emit frameReady,
+    // 接收方在 GUI 线程 → 自动队列投递)
+    Impl(int slot, const QString &portName, int frameFormat, qint32 baudRate,
+         std::function<void(int, QByteArray, qint64)> sink)
+        : m_slot(slot), m_portName(portName), m_frameFormat(frameFormat),
+          m_baudRate(baudRate), m_sink(std::move(sink)) {}
+
+    void requestQuit() { m_quit.store(true); }
+    bool ready() const { return m_ready.load(); }
+    bool opened() const { return m_opened.load(); }
+    quint64 received() const { return m_recv.load(); }
+    quint64 dropped() const { return m_dropped.load(); }
+
+protected:
+    void run() override {
+        if (m_portName.isEmpty()) { m_ready = true; return; }   // 空闲槽位
+
+        QSerialPort sp;
+        sp.setPortName(m_portName);
+        if (!sp.open(QIODevice::ReadOnly)) { m_ready = true; return; }
+        const bool paramsOk = sp.setBaudRate(m_baudRate)
+                              && sp.setDataBits(QSerialPort::Data8)
+                              && sp.setParity(QSerialPort::NoParity)
+                              && sp.setStopBits(QSerialPort::TwoStop)
+                              && sp.setFlowControl(QSerialPort::NoFlowControl);
+        if (!paramsOk || sp.baudRate() != m_baudRate) { m_ready = true; return; }
+        m_opened = true;
+        m_ready = true;
+
+        // 帧长与对齐规则同原 GUI 线程实现:
+        //   fmt0: 513 = 0x00+512; fmt1: 514 = 前导1字节+0x00+512; fmt2: 512 无起始码
+        const int frameLen = (m_frameFormat == 1) ? 514 : (m_frameFormat == 2 ? 512 : 513);
+        QByteArray buf;
+        while (!m_quit.load()) {
+            if (!sp.waitForReadyRead(100)) continue;   // 100ms 轮询退出标志
+            buf += sp.readAll();
+            while (buf.size() >= frameLen) {
+                if (m_quit.load()) break;
+                QByteArray dmx;
+                int consume = frameLen;
+                if (m_frameFormat == 2) {
+                    dmx = buf.left(512);
+                } else if (uchar(buf.at(0)) == 0x00) {
+                    dmx = buf.mid(1, 512);
+                } else if (frameLen >= 514 || uchar(buf.at(1)) == 0x00) {
+                    dmx = buf.mid(2, 512);   // 514 格式跳过前导字节; 513 格式起始码错位 1 字节
+                } else {
+                    buf.remove(0, 1);        // 失步: 丢 1 字节重找起始码
+                    m_dropped.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                if (dmx.size() < 512) dmx.append(QByteArray(512 - dmx.size(), 0));
+                buf.remove(0, consume);
+                m_recv.fetch_add(1, std::memory_order_relaxed);
+                m_sink(m_slot, dmx, QDateTime::currentMSecsSinceEpoch() * 1000);
+            }
+            // 防积压: 缓冲远超一帧说明消费端跟不上或噪声, 保留尾部重新对齐
+            if (buf.size() > frameLen * 4) buf = buf.right(frameLen * 2);
+        }
+        m_opened = false;
+    }
+
+private:
+    int m_slot;
+    QString m_portName;
+    int m_frameFormat;
+    qint32 m_baudRate;
+    std::function<void(int, QByteArray, qint64)> m_sink;
+    std::atomic<bool> m_quit{false};
+    std::atomic<bool> m_ready{false};
+    std::atomic<bool> m_opened{false};
+    std::atomic<quint64> m_recv{0};
+    std::atomic<quint64> m_dropped{0};
+};
+
+DmxRxGroup::DmxRxGroup(QObject *parent) : QObject(parent) {}
+
+QStringList DmxRxGroup::start(const QStringList &portNames, int frameFormat, qint32 baudRate) {
+    stop();
+    QStringList failed;
+    m_workers.reserve(int(portNames.size()));
+    for (int i = 0; i < portNames.size(); ++i) {
+        auto *w = new Impl(i, portNames[i], frameFormat, baudRate,
+                           [this](int slot, QByteArray dmx, qint64 arrivedUs) {
+                               emit frameReady(slot, dmx, arrivedUs);
+                           });
+        w->start();
+        m_workers.append(w);
+    }
+    // 等待全部 worker 完成打开 (上限 3s 防异常驱动卡死 UI)
+    QElapsedTimer et;
+    et.start();
+    for (Impl *w : m_workers) {
+        while (!w->ready() && et.elapsed() < 3000)
+            QThread::msleep(2);
+    }
+    for (int i = 0; i < m_workers.size(); ++i) {
+        Impl *w = m_workers[i];
+        const bool active = !portNames[i].isEmpty();
+        if (!w->ready()) {
+            w->requestQuit();
+            if (!w->wait(1000)) w->terminate();
+            w->wait();
+            delete w;
+            m_workers[i] = nullptr;
+            if (active) failed << portNames[i];
+        } else if (active && !w->opened()) {
+            failed << portNames[i];
+        }
+    }
+    m_running = !m_workers.isEmpty();
+    return failed;
+}
+
+void DmxRxGroup::stop() {
+    m_running = false;
+    for (Impl *w : m_workers)
+        if (w) w->requestQuit();
+    for (Impl *w : m_workers) {
+        if (!w) continue;
+        if (!w->wait(1000)) w->terminate();
+        w->wait();
+        delete w;
+    }
+    m_workers.clear();
+}
+
+bool DmxRxGroup::isOpen(int i) const {
+    return i >= 0 && i < m_workers.size() && m_workers[i] && m_workers[i]->opened();
+}
+
+quint64 DmxRxGroup::framesReceived(int i) const {
+    return i >= 0 && i < m_workers.size() && m_workers[i] ? m_workers[i]->received() : 0;
+}
+
+quint64 DmxRxGroup::droppedBytes(int i) const {
+    return i >= 0 && i < m_workers.size() && m_workers[i] ? m_workers[i]->dropped() : 0;
+}

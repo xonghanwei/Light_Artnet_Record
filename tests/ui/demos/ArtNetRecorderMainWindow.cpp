@@ -4479,36 +4479,47 @@ void ArtNetRecorderMainWindow::refreshD2aPorts() {
 void ArtNetRecorderMainWindow::startDmxToArt() {
     stopDmxToArt();
 
-    // 对每个"启用且选了串口"的行开一个 QSerialPort; 单行失败只记日志, 不影响其余行
+    // 多线程接收组: 每路一个 worker 线程独占串口 (阻塞读取+组帧), 完整帧经队列信号
+    // 回 GUI 线程转换; 单口打开失败只记日志, 不影响其余行
+    QStringList rxNames;
+    for (int i = 0; i < kDmxToArtIns; ++i) {
+        DmxToArtInput &row = m_d2aIns[i];
+        row.slot = -1;
+        row.rxCount = 0;
+        row.seq = 0;
+        const QString portName = (row.chkEnabled && row.chkEnabled->isChecked() && row.cmbPort)
+                                     ? row.cmbPort->currentData().toString() : QString();
+        if (row.chkEnabled && row.chkEnabled->isChecked() && portName.isEmpty())
+            appendLog(tr("DMX→Art-Net: 输入 %1 已启用但未选择串口").arg(i + 1), "warn");
+        rxNames << portName;
+    }
+    const int fmt = m_d2aFormat ? m_d2aFormat->currentIndex() : 0;
+    const QStringList rxFailed = m_d2aGroup.start(rxNames, fmt);
     int opened = 0;
     QStringList openedDesc;
     for (int i = 0; i < kDmxToArtIns; ++i) {
-        DmxToArtInput &row = m_d2aIns[i];
-        row.accum.clear();
-        row.rxCount = 0;
-        row.seq = 0;
-        if (!row.chkEnabled || !row.chkEnabled->isChecked()) continue;
-        const QString portName = row.cmbPort ? row.cmbPort->currentData().toString() : QString();
-        if (portName.isEmpty()) {
-            appendLog(tr("DMX→Art-Net: 输入 %1 已启用但未选择串口").arg(i + 1), "warn");
+        if (rxNames[i].isEmpty() || rxFailed.contains(rxNames[i])) {
+            if (!rxNames[i].isEmpty() && rxFailed.contains(rxNames[i]))
+                appendLog(tr("DMX→Art-Net: 打开串口 %1 失败 (输入 %2)")
+                              .arg(rxNames[i]).arg(i + 1), "error");
             continue;
         }
-        row.serial = new QSerialPort(this);
-        if (!openDmxPort(row.serial, portName)) {
-            appendLog(tr("DMX→Art-Net: 打开串口 %1 失败 (输入 %2, %3)")
-                          .arg(portName, row.serial->errorString()).arg(i + 1), "error");
-            delete row.serial; row.serial = nullptr;
-            continue;
-        }
-        const int idx = i;
-        connect(row.serial, &QSerialPort::readyRead, this, [this, idx]{ onD2aSerialData(idx); });
+        m_d2aIns[i].slot = i;
         ++opened;
         openedDesc << tr("输入%1 %2 → 域%3")
-                      .arg(i + 1).arg(portName).arg(row.spinUni->value());
+                      .arg(i + 1).arg(rxNames[i]).arg(m_d2aIns[i].spinUni->value());
     }
     if (opened == 0) {
         appendLog(tr("DMX→Art-Net: 没有成功打开的 DMX 输入串口, 请检查启用行与端口选择"), "error");
+        m_d2aGroup.stop();
         return;
+    }
+
+    // 帧回调: worker 线程 emit → 接收方在 GUI 线程, 自动队列投递 (只连接一次)
+    if (!m_d2aRxConnected) {
+        connect(&m_d2aGroup, &DmxRxGroup::frameReady,
+                this, &ArtNetRecorderMainWindow::onD2aGroupFrame, Qt::QueuedConnection);
+        m_d2aRxConnected = true;
     }
 
     m_d2aSocket = new QUdpSocket(this);
@@ -4538,14 +4549,9 @@ void ArtNetRecorderMainWindow::startDmxToArt() {
 }
 
 void ArtNetRecorderMainWindow::stopDmxToArt() {
-    for (int i = 0; i < kDmxToArtIns; ++i) {
-        if (m_d2aIns[i].serial) {
-            m_d2aIns[i].serial->close();
-            m_d2aIns[i].serial->deleteLater();
-            m_d2aIns[i].serial = nullptr;
-        }
-        m_d2aIns[i].accum.clear();
-    }
+    m_d2aGroup.stop();
+    for (int i = 0; i < kDmxToArtIns; ++i)
+        m_d2aIns[i].slot = -1;
     if (m_d2aSocket) {
         m_d2aSocket->close();
         m_d2aSocket->deleteLater();
@@ -4556,43 +4562,24 @@ void ArtNetRecorderMainWindow::stopDmxToArt() {
         m_lblD2aState->setText(tr("<span style='color:#8fb3d9'>未启动</span>"));
 }
 
-void ArtNetRecorderMainWindow::onD2aSerialData(int row) {
-    if (row < 0 || row >= kDmxToArtIns) return;
-    DmxToArtInput &in = m_d2aIns[row];
-    if (!in.serial || !m_d2aSocket) return;
-    in.accum.append(in.serial->readAll());
+// 接收组帧回调: worker 线程组好的完整帧经队列信号到达 GUI 线程,
+// 只做计数/回显/UDP 转换, 不再涉及串口字节与帧对齐
+void ArtNetRecorderMainWindow::onD2aGroupFrame(int slot, const QByteArray &dmx, qint64 arrivedUs) {
+    if (slot < 0 || slot >= kDmxToArtIns || !m_d2aSocket) return;
+    DmxToArtInput &in = m_d2aIns[slot];
+    if (in.slot != slot) return;   // 已停止/槽位失效, 丢弃在途帧
 
-    const int fmt = m_d2aFormat ? m_d2aFormat->currentIndex() : 0;
-    const int frameLen = (fmt == 1) ? 514 : (fmt == 2 ? 512 : 513);
+    const qint64 nowUs = QDateTime::currentMSecsSinceEpoch() * 1000;
+    in.rxCount++;
+    m_d2aLastDmx = dmx.left(512);
+    m_d2aLastUni = quint16(in.spinUni ? in.spinUni->value() : 0);
 
-    while (in.accum.size() >= frameLen) {
-        const QByteArray frame = in.accum.left(frameLen);
-        QByteArray dmx;
-        if (frameLen == 512) {
-            dmx = frame;
-        } else {
-            // 兼容起始码前多一个字节的适配器
-            if (uchar(frame.at(0)) == 0x00)      dmx = frame.mid(1, 512);
-            else if (uchar(frame.at(1)) == 0x00) dmx = frame.mid(2, 512);
-            else { in.accum.remove(0, 1); ++m_d2aDropCount; continue; }
-        }
-        in.accum.remove(0, frameLen);
-        if (dmx.size() < 512) dmx.append(QByteArray(512 - dmx.size(), 0));
+    if (m_d2aFeedIn && m_d2aFeedIn->isChecked())
+        feedLiveUniverse(true, m_d2aLastUni, m_d2aLastDmx, nowUs);
 
-        const qint64 nowUs = QDateTime::currentMSecsSinceEpoch() * 1000;
-        in.rxCount++;
-        m_d2aLastDmx = dmx.left(512);
-        m_d2aLastUni = quint16(in.spinUni ? in.spinUni->value() : 0);
-
-        if (m_d2aFeedIn && m_d2aFeedIn->isChecked())
-            feedLiveUniverse(true, m_d2aLastUni, m_d2aLastDmx, nowUs);
-
-        convertDmxToArt(row, m_d2aLastDmx);
-        m_d2aLatencyUs = QDateTime::currentMSecsSinceEpoch() * 1000 - nowUs;
-    }
-
-    if (in.accum.size() > frameLen * 4)
-        in.accum = in.accum.right(frameLen * 2);
+    convertDmxToArt(slot, m_d2aLastDmx);
+    // 延迟 = worker 组帧时刻 → GUI 转换完成 (含队列投递与 UDP 写出)
+    m_d2aLatencyUs = QDateTime::currentMSecsSinceEpoch() * 1000 - arrivedUs;
 }
 
 void ArtNetRecorderMainWindow::convertDmxToArt(int row, const QByteArray &dmx) {
@@ -4620,7 +4607,9 @@ QWidget *ArtNetRecorderMainWindow::buildPageDmxToArt() {
 
     auto *hint = new QLabel(tr("DMX512 → Art-Net 转换测试 — 支持最多 8 路 DMX 串口同时输入 (250000 8N2), "
                                "每路按各自「目标 Universe」打包成 ArtDMX 数据报, 立即发往全局目标 IP:端口; "
-                               "帧格式与目标地址对所有输入行共用. 可用本机「Art-Net 测试 → 接收测试」验证输出."));
+                               "帧格式与目标地址对所有输入行共用. 接收采用多线程模式: 每路独立 worker 线程"
+                               "独占串口阻塞读取并组帧, 完整帧经队列信号回主线程转换, GUI 卡顿不影响收帧. "
+                               "可用本机「Art-Net 测试 → 接收测试」验证输出."));
     hint->setWordWrap(true);
     hint->setStyleSheet("color:#8fb3d9; font-size:12px;");
     root->addWidget(hint);
@@ -4747,16 +4736,18 @@ QWidget *ArtNetRecorderMainWindow::buildPageDmxToArt() {
     // 转换结果统计交给调度器统计组 (仅本页可见时执行)
     addStatTask(page, [this]{
         quint64 totalRx = 0;
+        quint64 groupDrops = 0;
         for (int i = 0; i < kDmxToArtIns; ++i) {
             totalRx += m_d2aIns[i].rxCount;
+            groupDrops += m_d2aGroup.droppedBytes(i);
             if (m_d2aIns[i].lblRx)
-                m_d2aIns[i].lblRx->setText(m_d2aIns[i].serial
+                m_d2aIns[i].lblRx->setText(m_d2aIns[i].slot >= 0
                                                ? QString::number(m_d2aIns[i].rxCount)
                                                : QStringLiteral("--"));
         }
         if (m_lblD2aRx)      m_lblD2aRx->setText(QString::number(totalRx));
         if (m_lblD2aTx)      m_lblD2aTx->setText(QString::number(m_d2aTxCount));
-        if (m_lblD2aDrop)    m_lblD2aDrop->setText(QString::number(m_d2aDropCount));
+        if (m_lblD2aDrop)    m_lblD2aDrop->setText(QString::number(m_d2aDropCount + groupDrops));
         if (m_lblD2aUni)     m_lblD2aUni->setText(totalRx ? QString::number(m_d2aLastUni) : "--");
         if (m_lblD2aLatency) m_lblD2aLatency->setText(m_d2aLatencyUs > 0
                                                           ? QString("%1 µs").arg(m_d2aLatencyUs)
@@ -4775,15 +4766,14 @@ QWidget *ArtNetRecorderMainWindow::buildPageDmxToArt() {
     refreshD2aPorts();
     if (qEnvironmentVariableIntValue("ARTNET_UI_D2A_AUTOSTART") == 1)
         QTimer::singleShot(700, this, [this]{ startDmxToArt(); });
-    // 自动化验证: 注入一帧合成 DMX 数据, 走完整的解析/转换路径
+    // 自动化验证: 直接注入一帧合成 DMX 数据到帧回调, 验证 回显/转换/UDP 路径
+    // (串口字节组帧已移到 worker 线程, 由 DmxRxGroup 内部逻辑覆盖)
     if (qEnvironmentVariableIntValue("ARTNET_UI_D2A_SELFTEST") == 1)
         QTimer::singleShot(1500, this, [this]{
-            if (!m_d2aIns[0].serial) return;
-            QByteArray f(1, char(0x00));
-            f.append(QByteArray(512, 0));
-            f[1] = char(200);
-            m_d2aIns[0].accum.append(f);
-            onD2aSerialData(0);
+            if (m_d2aIns[0].slot < 0) return;
+            QByteArray dmx(512, 0);
+            dmx[0] = char(200);
+            onD2aGroupFrame(0, dmx, QDateTime::currentMSecsSinceEpoch() * 1000);
         });
 
     return page;

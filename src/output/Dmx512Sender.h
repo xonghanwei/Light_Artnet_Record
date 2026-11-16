@@ -175,4 +175,45 @@ private:
     bool m_running = false;
 };
 
+// ============================================================
+// DmxRxGroup — 多端口 DMX512 接收线程组
+//
+// 8 路串口接收若全挂在 GUI 线程 (readyRead 回调), 重绘/其它定时器会拖慢
+// 读取节奏, 250000 波特率下驱动缓冲积压导致帧延迟甚至丢字节。
+// 本类为每个端口配一个独立 worker 线程 (线程内独占 QSerialPort,
+// 阻塞式 waitForReadyRead 循环), 组帧完成后经队列信号把整帧送 GUI,
+// 串口高频读取与帧对齐完全脱离主线程。
+// ============================================================
+class DmxRxGroup : public QObject {
+    Q_OBJECT
+public:
+    explicit DmxRxGroup(QObject *parent = nullptr);
+    ~DmxRxGroup() { stop(); }
+
+    /**
+     * @brief 为每个端口名启动一个接收 worker 线程 (空名 = 空闲槽位)
+     * @param frameFormat 0=513 (0x00+512), 1=514 (起始码前多 1 字节), 2=512 (无起始码)
+     * @return 打开失败的端口名列表 (空 = 全部成功)
+     */
+    QStringList start(const QStringList &portNames, int frameFormat, qint32 baudRate = 250000);
+
+    /// 停止全部 worker 并关闭串口 (可重复调用)
+    void stop();
+
+    bool isRunning() const { return m_running; }
+    int count() const { return int(m_workers.size()); }
+    bool isOpen(int i) const;
+    quint64 framesReceived(int i) const;
+    quint64 droppedBytes(int i) const;   // 帧失步丢弃的字节数
+
+signals:
+    /// 收到完整一帧 (512 通道), 经队列连接投递到 GUI 线程; arrivedUs 为组帧时刻 (μs)
+    void frameReady(int slot, const QByteArray &dmx512, qint64 arrivedUs);
+
+private:
+    class Impl;   // 单端口接收 worker 线程 (定义在 .cpp)
+    QVector<Impl*> m_workers;
+    bool m_running = false;
+};
+
 #endif // DMX512_SENDER_H
