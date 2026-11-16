@@ -210,32 +210,214 @@ struct ConnectionParams {
 
 ### 3.2 MA NPU / Ma-Net2 (UDP 9999)
 
-MA Lighting 的主从架构协议。
+MA Lighting 的主从架构协议 (grandMA2/3 控台推送 DMX)。传输为单播/广播推送，接收端不加组播组。
 
-**DMX 数据包格式**:
+**DMX 数据包格式** (整包 516 字节, `NpuProtocol::DMX_PACKET_SIZE = 2 + 1 + 1 + 512`):
 ```
 偏移  长度  字段
-0     2     length (小端, 固定 514)
+0     2     length (小端, = 514, 即 cmd+universe+512B 数据的负载字节数, 不含本 2 字节头)
 2     1     cmd (0x01 = DMX 数据)
-3     1     universe (0-255)
+3     1     universe (0-255, 原始编号)
 4     512   DMX 通道数据
 ```
+> 校验口径: 接收端 `NpuSource` 仅校验整包长度 ≥ 516，**不校验** length 字段值；发送端 `NpuSink` 在 length 字段写 514。
 
-**常用 OpCode**:
+**OpCode 表** (`src/protocol/ProtocolTypes.h` — `NpuProtocol` 命名空间):
 
-| cmd | 含义 |
-|-----|------|
-| 0x01 | DMX 数据包 |
-| 0x02 | Universe 信息 / 请求 |
-| 0x03 | 时间码 |
-| 0x10 | MA 专用命令 |
+| cmd | 常量 | 含义 |
+|-----|------|------|
+| 0x01 | `OP_DMX` | DMX 数据包 |
+| 0x02 | `OP_UNIVERSE_INFO` | Universe 信息 / 请求 |
+| 0x03 | `OP_TIMECODE` | 时间码 |
+| 0x10 | `OP_MA_COMMAND` | MA 专用命令 |
 
-### 3.3 DMX512 (串口)
+非 0x01 的包接收端静默忽略。
 
-**协议帧**: BREAK(90μs) + MAB(12μs) + Start Code(0x00) + 512 channels  
-**串口参数**: 250000 baud, 8 data bits, 2 stop bits, No parity  
-**接收说明**: DMX512 通常是单向的(控制台→灯具), 接收需要硬件支持 (Enttec Pro Mk3 等)  
-**发送说明**: 用 USB-DMX 设备 (DMXKing ultraDMX Micro, Enttec Open DMX) 发送
+**关键参数**:
+
+| 项 | 值 |
+|---|---|
+| 默认端口 | 9999 (`NpuProtocol::DEFAULT_PORT`) |
+| Universe 范围 | 0–255 |
+| 原始编号 | 存于 `LightFrame::universeRaw`，协议转换路由 (如 NPU→DMX 桥接) 必须用它 |
+| ArtNet 兼容编码 | `LightFrame::universe = universeRaw & 0x0F` (Net=0, SubNet=0)，仅供统一帧结构使用，不适合直接路由 |
+
+### 3.3 DMX512 / RS-485 (串口)
+
+**协议帧**: BREAK(≥92μs) + MAB(≥8μs) + Start Code(0x00) + 512 channels (整帧 513 字节)  
+**串口参数**: 250000 baud, 8 data bits, 2 stop bits, No parity (8N2)  
+**电气**: RS-485 差分半双工; 本项目只做发送器 (TX) 与只读接收器 (RX), 无 DE/RE 方向控制, 不支持 RDM 反向应答
+
+#### 3.3.1 发送实现 (`src/output/Dmx512Sender.cpp`)
+
+**串口参数校验** (`open()`): 必须先 `open(QIODevice::WriteOnly)` 再下发 250000 8N2 —— 端口未打开时 `setBaudRate` 只缓存参数且恒返回 true, 驱动是否支持要到真正下发时才暴露; 五项设置逐一检查返回值并回读 `baudRate()` 比对, 任一失败即关闭端口、发 `portError` 信号并返回 false。250000 为非标准波特率, 部分 CH340/PL2303 驱动不支持, 若不校验会静默按错误波特率发帧 (现象为灯具乱闪/无响应)。
+
+```cpp
+// Dmx512Sender::open() — 先 open 再下发参数, 回读校验 (L79-L96)
+if (!m_serial->open(QIODevice::WriteOnly)) { /* 报错 + portError, 返回 false */ }
+
+const bool paramsOk = m_serial->setBaudRate(baudRate)
+    && m_serial->setDataBits(QSerialPort::Data8)
+    && m_serial->setParity(QSerialPort::NoParity)
+    && m_serial->setStopBits(QSerialPort::TwoStop)
+    && m_serial->setFlowControl(QSerialPort::NoFlowControl);
+if (!paramsOk || m_serial->baudRate() != baudRate) {
+    closeLocked();                       // 驱动不支持 250000/8N2 → 拒绝启动
+    emit portError(...);                 // 锁释放后再 emit, 防槽重入死锁
+    return false;
+}
+```
+
+**微秒级延时** (`preciseDelayUs()`): Windows `Sleep`/`usleep` 受系统定时器精度 (~15.6ms) 限制, 无法满足 BREAK 100μs 时序, 必须用高分辨率单调时钟忙等 —— Windows `QueryPerformanceCounter`, POSIX `clock_gettime(CLOCK_MONOTONIC)`。
+
+```cpp
+// Dmx512Sender.cpp L18-L38
+static inline void preciseDelayUs(int us)
+{
+#ifdef Q_OS_WIN
+    static LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    LARGE_INTEGER start, now;
+    QueryPerformanceCounter(&start);
+    const LONGLONG target = static_cast<LONGLONG>(freq.QuadPart * (static_cast<double>(us) / 1000000.0));
+    do { QueryPerformanceCounter(&now); } while (now.QuadPart - start.QuadPart < target);
+#else
+    struct timespec start{}, now{};
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    const long ns = static_cast<long>(us) * 1000L;
+    do { clock_gettime(CLOCK_MONOTONIC, &now); }
+    while ((now.tv_sec - start.tv_sec) * 1000000000L + (now.tv_nsec - start.tv_nsec) < ns);
+#endif
+}
+```
+
+**平台延时计算原理**:
+
+本质是同一公式: `目标计数 = 时钟频率 × 延迟时长`, 循环直到 `当前计数 - 起始计数 ≥ 目标计数`。两平台差异在时钟源:
+
+| 平台 | 时钟源 | 频率 | 换算 | 注意事项 |
+|---|---|---|---|---|
+| Windows | `QueryPerformanceCounter` | **不固定** (现代机典型 10MHz=100ns/tick, 少数为 CPU 主频) | `target = freq × us / 1e6`, 必须先 `QueryPerformanceFrequency` 动态获取, 不能假设 1 tick=100ns | 频率 static 缓存一次 |
+| Linux/macOS | `clock_gettime` | 固定纳秒分辨率 (1e9 Hz) | `ns = us × 1000`, 无需查频率 | 必须用 `CLOCK_MONOTONIC`: `CLOCK_REALTIME` 遇 NTP 校时/手动回拨时差值变负, 循环挂死或提前退出; 32 位 `long` 下 `(秒差)×1e9` 要求秒差 ≤2.1s, 对 μs 级延时足够 |
+
+为什么必须忙等而不是 `Sleep`/`usleep`:
+
+| 机制 | 最小粒度 | 请求 100μs 实际耗时 |
+|---|---|---|
+| `Sleep(1)` / `usleep(100)` | 系统定时器 ~15.6ms (未调 `timeBeginPeriod` 时) | 1~16ms, BREAK 波形失真 10~160 倍 |
+| 高精度时钟忙等 | tick 级 (~0.1μs / ns) | ≈100μs |
+
+sleep 语义是"至少 X 后唤醒", 唤醒还要过调度器, 抖动毫秒级; DMX BREAK 规范下限 92μs, 只有忙等能保证。代价: 每帧自旋 115μs (BREAK 100 + MAB 15), 44Hz 满帧 CPU 占用 ≈0.5%, 可接受。
+
+**三种 BREAK 发送方式** (按优先级自动选择):
+
+| # | 方式 | 平台 | 实现 | 时序 |
+|---|------|------|------|------|
+| 1 | 硬件 BREAK | Windows | `EscapeCommFunction(handle, SETBREAK)` → 拉低 TX | SETBREAK → 100μs → CLRBREAK → 15μs MAB |
+| 2 | 硬件 BREAK | Linux/macOS | `ioctl(fd, TIOCSBRK)` / `TIOCCBRK` | 同上 |
+| 3 | 软件模拟 (回退) | 全平台 | 写 2 字节 `0x00` + `flush()` + 100μs | 非连续低电平, 见局限 |
+
+- 方式 1/2 检查 API 返回值; 失败 (部分驱动不实现 break 控制, 如旧版 ch341) 则置 `m_hwBreakFailed` 记住状态并**永久降级**到方式 3, 避免每帧重复探测; `open()` 成功时重置该状态 (换设备后重新探测)。
+- 方式 2 不用 `tcsendbreak(fd, 0)`: POSIX 规定 duration=0 时 BREAK 固定约 0.25s, 超规范 ~2700 倍, 每帧卡死 250ms。
+- 方式 3 的局限: 8N2 下每个 0x00 字节含停止位间隙, 线路是"低-高-低"而非连续 ≥92μs 低电平, 且接收端会把这两个 0x00 解析成 Start Code + 通道 1 数据而非 BREAK。仅部分接收器可容忍, 只在拿不到原生句柄/驱动不支持时兜底。
+- 探测顺序: 每帧先试硬件方式, `hwBreakSent == false` 才走软件回退, 随后统一发送 `buildDmxFrame()` 产物 (Start Code 0x00 + 512 通道, 不足补 0)。
+
+**方式 1 — Windows 硬件 BREAK** (`sendFrame()` L178-L192):
+
+```cpp
+HANDLE handle = m_serial->handle();            // QSerialPort 原生句柄
+if (handle != INVALID_HANDLE_VALUE) {
+    const BOOL setOk  = EscapeCommFunction(handle, SETBREAK);  // TX 强制拉低
+    preciseDelayUs(100);                                       // BREAK ≥92μs
+    const BOOL clrOk = EscapeCommFunction(handle, CLRBREAK);   // 释放回空闲高电平
+    preciseDelayUs(15);                                        // MAB ≥8μs
+    hwBreakSent = setOk && clrOk;
+    if (!hwBreakSent && !m_hwBreakFailed) {    // 无论 SETBREAK 结果都尝试了 CLRBREAK,
+        m_hwBreakFailed = true;                // 防线路卡死在 break 态; 记住失败, 后续帧不再探测
+    }
+}
+```
+
+**方式 2 — Linux/macOS 硬件 BREAK** (`sendFrame()` L194-L208):
+
+```cpp
+const int fd = static_cast<int>(m_serial->handle());
+const int setOk = ioctl(fd, TIOCSBRK);         // TX 强制拉低 (驱动实现, 非 tcsendbreak!)
+preciseDelayUs(100);
+const int clrOk = ioctl(fd, TIOCCBRK);         // 释放
+preciseDelayUs(15);
+hwBreakSent = (setOk == 0 && clrOk == 0);
+if (!hwBreakSent && !m_hwBreakFailed) { m_hwBreakFailed = true; }
+```
+
+> 弃用 `tcsendbreak(fd, 0)` 的原因: POSIX 规定 duration=0 时 BREAK 固定约 0.25s (超规范 ~2700 倍), 每帧卡 250ms。
+
+**方式 3 — 软件模拟回退** (`sendFrame()` L211-L221, 仅当硬件方式不可用):
+
+```cpp
+if (!hwBreakSent) {
+    // 2 字节 0x00 @250k ≈ 88μs 低电平; 8N2 下含停止位间隙, 非连续低, 部分接收器可容忍
+    const qint64 brk = m_serial->write("\x00\x00", 2);
+    const bool brkFlushed = m_serial->flush();
+    preciseDelayUs(100);                       // 近似 BREAK
+    preciseDelayUs(15);                        // 近似 MAB
+    if (brk != 2 || !brkFlushed) { /* portError, 返回 false */ }
+}
+```
+
+**帧体发送** (三种方式共用, `sendFrame()` L232-L241):
+
+```cpp
+const QByteArray frame = buildDmxFrame(data);  // 0x00 + 512 通道 (不足补 0)
+const qint64 written = m_serial->write(frame);
+if (written != frame.size() || !m_serial->flush()) {
+    // 适配器运行中被拔出等: 不静默计入 m_framesSent
+    emit portError(m_serial->errorString());   // 锁释放后 emit
+    return false;
+}
+m_framesSent++;
+```
+
+**发送流程** (`sendFrame()`): 全程持 `m_mutex` (open/close 同锁, 防并发 delete); `write` 校验整帧写入量, `flush` 校验返回值 (适配器被拔出时不静默计入 `m_framesSent`)。`open/close` 的信号统一在**释放锁后** emit, 防槽函数回调造成非递归锁死锁。
+
+**时序约束**: 513 字节 @250000 (11 bit/字节) 线上时间 ≈ 22.6ms, 帧率上限 ~44Hz (符合 DMX 标准); 上层调用间隔小于 22.6ms 时, 下一帧的 SETBREAK 会截断上一帧尾部 —— DMX 接收器以 BREAK 复位可容忍。
+
+#### 3.3.2 接收实现 (`src/protocol/sources/Dmx512Source.cpp`)
+
+- 以 `QIODevice::ReadOnly` 打开, 参数校验与发送侧同一规则 (先 open 后下发 + 回读比对)。
+- 异步接收: `readyRead` 信号 → `readAll()` 追加进 `m_readBuffer`, 串口层可能把一帧拆成多次读, 需缓冲区对齐。
+- 帧提取: 循环取 ≥513 字节 —— 在前 10 字节内搜索 Start Code `0x00` 作对齐标记 (找不到丢弃缓冲); 命中后 `mid(startIdx)` 去头, `left(513)` 取一帧, 跳过 Start Code 取 512 通道数据。
+
+```cpp
+// Dmx512Source::processSerialData() L97-L137 — 缓冲区对齐 + Start Code 搜索
+QByteArray incoming = m_serial->readAll();
+m_readBuffer.append(incoming);
+
+while (m_readBuffer.size() >= 513) {
+    int startIdx = -1;                          // 前 10 字节内找 Start Code 0x00
+    for (int i = 0; i < m_readBuffer.size() && i < 10; ++i) {
+        if (quint8(m_readBuffer[i]) == 0x00) { startIdx = i; break; }
+    }
+    if (startIdx < 0) { m_readBuffer.clear(); break; }   // 无帧头, 丢弃重同步
+    if (startIdx > 0) m_readBuffer = m_readBuffer.mid(startIdx);
+    if (m_readBuffer.size() < 513) break;                // 半帧, 等下一次 readyRead
+
+    QByteArray frame = m_readBuffer.left(513);           // Start Code + 512 通道
+    m_readBuffer = m_readBuffer.mid(513);
+
+    LightFrame lf;
+    lf.sourceProtocol = ProtocolType::Dmx512;
+    lf.universe = 0;  lf.universeRaw = 0;                // DMX512 无 Universe 概念
+    lf.dmxData = frame.mid(1, 512);                      // 跳过 Start Code
+    lf.timestampUs = QDateTime::currentMSecsSinceEpoch() * 1000;
+    lf.sequence = quint32(m_framesReceived);
+    m_framesReceived++;
+    emit frameReceived(lf);
+}
+```
+- 输出 `LightFrame`: `universe = universeRaw = 0` (DMX512 无 Universe 概念), 打时间戳与递增序号, emit `frameReceived`。
+- 注意: 本类依赖 BREAK 做帧边界不可靠 (串口层已抹掉 BREAK 电平信息), 实际以 Start Code 搜索对齐; 连续两帧间若有噪声字节, 靠搜索窗口重新同步。
+
+**接收硬件要求**: DMX512 线路通常单向 (控台→灯具), 接收需硬件支持 RX 方向 (Enttec Pro Mk3 等带光耦双向适配器)。
 
 ---
 
@@ -412,11 +594,12 @@ onPreviewTick()  (每帧周期触发)
 - **谁解析帧头**: Source 内部负责, LightFrame 已经是协议无关的数据
 - **为什么包装现有 ArtNetReceiver**: 不重写底层, 只是加一层适配器
 
-### 9.2 DMX512 BREAK 发送 (v1.1)
+### 9.2 DMX512 BREAK 发送 (v1.1, v1.3 修订)
 - **Windows**: `EscapeCommFunction(h, SETBREAK/CLRBREAK)` 硬件 BREAK
-- **Linux**: `tcsendbreak(fd, 0)` POSIX BREAK  
-- **回退**: 写 0x00 + 延时模拟
-- 不同 USB-DMX 设备对 BREAK 支持程度不同
+- **Linux/macOS**: `ioctl(fd, TIOCSBRK/TIOCCBRK)` 硬件 BREAK —— 弃用早期方案 `tcsendbreak(fd, 0)`: POSIX 规定 duration=0 时 BREAK 固定约 0.25s, 超 DMX 规范 ~2700 倍
+- **回退**: 写 2 字节 0x00 + 延时模拟 (非连续低电平, 仅兜底); 硬件 API 失败自动降级并记住状态, 换串口后重新探测
+- **延时**: 一律 QPC/CLOCK_MONOTONIC 忙等 (`preciseDelayUs`), 不用 Sleep/usleep (定时器精度 ~15.6ms 会破坏 100μs 时序)
+- 详见 §3.3.1; 不同 USB-DMX 设备对 BREAK 支持程度不同, 真机建议示波器验证波形
 
 ### 9.3 Universe 编码
 - ArtNet: NetSubUni (7+4+4 bit)

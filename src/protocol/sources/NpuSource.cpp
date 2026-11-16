@@ -86,7 +86,7 @@ void NpuSource::processDatagram(const QNetworkDatagram &datagram) {
     
     switch (cmd) {
         case NpuProtocol::OP_DMX: {
-            // DMX 数据包: 期望长度 = 1 + 1 + 512 = 514
+            // DMX 数据包: 期望长度 = 2(长度头) + 1(命令) + 1(域) + 512(数据) = 516
             if (data.size() >= NpuProtocol::DMX_PACKET_SIZE) {
                 LightFrame lf;
                 if (parseDmxPacket(data, lf)) {
