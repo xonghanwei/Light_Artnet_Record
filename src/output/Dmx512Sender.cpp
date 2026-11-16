@@ -330,3 +330,160 @@ QStringList Dmx512Sender::availablePorts() {
     }
     return result;
 }
+
+// ============================================================
+// DmxSyncGroup — 多端口 BREAK 绝对时刻同步发送组
+// ============================================================
+#include <QThread>
+#include <QWaitCondition>
+#include <atomic>
+
+// 单端口 worker 线程: 在本线程内创建并独占 Dmx512Sender (QSerialPort 非线程安全,
+// 打开/写入均发生在 run() 内), GUI 线程只通过原子标志与互斥暂存区交互
+class DmxSyncGroup::Impl : public QThread {
+public:
+    Impl(const QString &portName, qint32 baudRate)
+        : m_portName(portName), m_baudRate(baudRate) {}
+
+    // 协调者调用: 暂存帧与绝对目标时刻, 唤醒线程
+    void stage(const QByteArray &frame, quint64 targetUs) {
+        QMutexLocker locker(&m_mtx);
+        m_frame = frame;
+        m_targetUs = targetUs;
+        m_gen++;
+        m_cond.wakeAll();
+    }
+    void requestQuit() {
+        QMutexLocker locker(&m_mtx);
+        m_quit = true;
+        m_cond.wakeAll();
+    }
+    bool ready() const { return m_ready.load(); }        // 打开流程已结束 (成功或失败)
+    bool opened() const { return m_opened.load(); }
+    quint64 sent() const { return m_sent.load(); }
+
+protected:
+    void run() override {
+#ifdef Q_OS_WIN
+        // 提高优先级: 降低调度抢占抖动, 保证各线程自旋到点后及时进入 BREAK
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#endif
+        if (m_portName.isEmpty()) { m_ready = true; return; }   // 空闲槽位
+
+        Dmx512Sender sender;
+        m_opened = sender.open(m_portName, m_baudRate);
+        m_ready = true;
+        if (!m_opened) return;
+
+        quint64 seen = 0;
+        for (;;) {
+            QByteArray frame;
+            quint64 target = 0;
+            {
+                QMutexLocker locker(&m_mtx);
+                while (!m_quit && m_gen == seen)
+                    m_cond.wait(&m_mtx);
+                if (m_quit) break;
+                seen = m_gen;
+                frame = m_frame;
+                target = m_targetUs;
+            }
+            // 自旋等待绝对时刻: 线程唤醒延迟被 commit 的提前量吸收,
+            // 到点后全部线程在同一 QPC 刻度附近进入 BREAK (偏差数十微秒级)
+            while (DmxSyncGroup::nowUs() < target) {}
+            if (sender.sendFrameAsync(frame))
+                m_sent.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+private:
+    QString m_portName;
+    qint32 m_baudRate;
+    QMutex m_mtx;
+    QWaitCondition m_cond;
+    QByteArray m_frame;
+    quint64 m_targetUs = 0;
+    quint64 m_gen = 0;
+    bool m_quit = false;
+    std::atomic<bool> m_ready{false};
+    std::atomic<bool> m_opened{false};
+    std::atomic<quint64> m_sent{0};
+};
+
+QStringList DmxSyncGroup::start(const QStringList &portNames, qint32 baudRate) {
+    stop();
+    QStringList failed;
+    m_workers.reserve(int(portNames.size()));
+    for (const QString &name : portNames) {
+        auto *w = new Impl(name, baudRate);
+        w->start();
+        m_workers.append(w);
+    }
+    // 等待全部 worker 完成串口打开 (单口 open 含驱动调用, 上限 3s 防异常驱动卡死 UI)
+    QElapsedTimer et;
+    et.start();
+    for (Impl *w : m_workers) {
+        while (!w->ready() && et.elapsed() < 3000)
+            QThread::msleep(2);
+    }
+    for (int i = 0; i < m_workers.size(); ++i) {
+        Impl *w = m_workers[i];
+        const bool active = !portNames[i].isEmpty();
+        if (!w->ready()) {
+            // 打开流程超时: 记失败并回收该线程 (驱动挂死等极端情况)
+            w->requestQuit();
+            if (!w->wait(1000)) w->terminate();
+            w->wait();
+            delete w;
+            m_workers[i] = nullptr;
+            if (active) failed << portNames[i];
+        } else if (active && !w->opened()) {
+            failed << portNames[i];
+        }
+    }
+    m_running = !m_workers.isEmpty();
+    return failed;
+}
+
+void DmxSyncGroup::stop() {
+    m_running = false;
+    for (Impl *w : m_workers)
+        if (w) w->requestQuit();
+    for (Impl *w : m_workers) {
+        if (!w) continue;
+        if (!w->wait(3000)) w->terminate();
+        w->wait();
+        delete w;
+    }
+    m_workers.clear();
+}
+
+bool DmxSyncGroup::isOpen(int i) const {
+    return i >= 0 && i < m_workers.size() && m_workers[i] && m_workers[i]->opened();
+}
+
+quint64 DmxSyncGroup::framesSent(int i) const {
+    return i >= 0 && i < m_workers.size() && m_workers[i] ? m_workers[i]->sent() : 0;
+}
+
+void DmxSyncGroup::commit(const QVector<QByteArray> &frames, quint64 targetUs) {
+    if (!m_running) return;
+    for (int i = 0; i < m_workers.size(); ++i) {
+        Impl *w = m_workers[i];
+        if (w && w->opened())
+            w->stage(frames.value(i), targetUs);
+    }
+}
+
+quint64 DmxSyncGroup::nowUs() {
+#ifdef Q_OS_WIN
+    static LARGE_INTEGER freq = []{ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    LARGE_INTEGER cnt;
+    QueryPerformanceCounter(&cnt);
+    return quint64(double(cnt.QuadPart) * 1000000.0 / double(freq.QuadPart));
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return quint64(ts.tv_sec) * 1000000ull + quint64(ts.tv_nsec) / 1000ull;
+#endif
+}

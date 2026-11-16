@@ -52,7 +52,7 @@ class MediaPlayerPanel;
 
 class QSerialPort;
 class QUdpSocket;
-class Dmx512Sender;
+#include "output/Dmx512Sender.h"
 class NpuSource;
 
 // 协议输入/输出页面共享的 tab 数据结构
@@ -504,7 +504,7 @@ private:
         QSpinBox     *spinStart  = nullptr;
         QSpinBox     *spinSpan   = nullptr;
         QLabel       *lblSent    = nullptr;
-        Dmx512Sender *sender     = nullptr;   // 未启动时为 nullptr
+        int           slot       = -1;        // DmxSyncGroup 同步槽位 (-1 = 未启用/打开失败)
         QByteArray    frame;                  // 最新待发送 512 通道 (收到包只更新缓存)
         bool          dirty = false;          // 有新数据待节拍发送
         qint64        arrivedUs = 0;          // 帧到达时刻 (ms*1000, 延迟统计)
@@ -524,6 +524,7 @@ private:
     QUdpSocket  *m_brSocket      = nullptr;
     QTimer      *m_brTickTimer   = nullptr;   // 23ms 统一发送节拍 (~43Hz)
     ArtToDmxOutput m_brOuts[kArtToDmxOuts];
+    DmxSyncGroup   m_brGroup;                  // 多线程绝对时刻同步发送组 (每口一个 worker)
     quint64      m_brRxCount     = 0;
     quint64      m_brDropCount   = 0;
     qint64       m_brLastLatencyUs = 0;
@@ -588,7 +589,7 @@ private:
         QSpinBox     *spinStart  = nullptr;
         QSpinBox     *spinSpan   = nullptr;
         QLabel       *lblSent    = nullptr;
-        Dmx512Sender *sender     = nullptr;   // 未启动时为 nullptr
+        int           slot       = -1;        // DmxSyncGroup 同步槽位 (-1 = 未启用/打开失败)
         QByteArray    frame;                  // 最新待发送 512 通道 (收到帧只更新缓存)
         bool          dirty = false;          // 有新数据待节拍发送
     };
@@ -605,7 +606,8 @@ private:
     QLabel      *m_lblNp2dCh1     = nullptr;
     NpuSource   *m_np2dSource     = nullptr;   // 复用生产 NPU 接收路径
     QTimer      *m_np2dTickTimer  = nullptr;   // 23ms 统一发送节拍 (~43Hz)
-    Np2dOutput   m_np2dOuts[kNp2dOuts];
+    Np2dOutput     m_np2dOuts[kNp2dOuts];
+    DmxSyncGroup   m_np2dGroup;                // 多线程绝对时刻同步发送组 (每口一个 worker)
     quint64      m_np2dRxCount    = 0;
     quint64      m_np2dDropCount  = 0;
     quint16      m_np2dLastUni    = 0;

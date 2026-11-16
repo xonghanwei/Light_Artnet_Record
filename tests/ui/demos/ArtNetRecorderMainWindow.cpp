@@ -4073,33 +4073,38 @@ void ArtNetRecorderMainWindow::startArtToDmx() {
     stopArtToDmx();
     if (!m_brListenPort) return;
 
-    // 对每个"启用且选了串口"的行创建一个 Dmx512Sender 并 open;
-    // 单行失败只记警告, 不影响其余行
+    // 多线程绝对时刻同步发送组: 每个"启用且选了串口"的行对应一个 worker 线程,
+    // 全部端口在同一绝对时刻 (QPC) 齐发 BREAK, 端口间偏差从方案1+2 的 ~1ms 降到数十微秒;
+    // 单口打开失败只记日志, 不影响其余行
+    QStringList syncNames;
+    for (int i = 0; i < kArtToDmxOuts; ++i) {
+        ArtToDmxOutput &row = m_brOuts[i];
+        row.slot = -1;
+        const QString portName = (row.chkEnabled && row.chkEnabled->isChecked() && row.cmbPort)
+                                     ? row.cmbPort->currentData().toString() : QString();
+        if (row.chkEnabled && row.chkEnabled->isChecked() && portName.isEmpty())
+            appendLog(tr("Art-Net→DMX: 输出 %1 已启用但未选择串口").arg(i + 1), "warn");
+        syncNames << portName;
+    }
+    const QStringList syncFailed = m_brGroup.start(syncNames);
     int opened = 0;
     QStringList openedDesc;
     for (int i = 0; i < kArtToDmxOuts; ++i) {
-        ArtToDmxOutput &row = m_brOuts[i];
-        if (!row.chkEnabled || !row.chkEnabled->isChecked()) continue;
-        const QString portName = row.cmbPort ? row.cmbPort->currentData().toString() : QString();
-        if (portName.isEmpty()) {
-            appendLog(tr("Art-Net→DMX: 输出 %1 已启用但未选择串口").arg(i + 1), "warn");
+        if (syncNames[i].isEmpty() || syncFailed.contains(syncNames[i])) {
+            if (!syncNames[i].isEmpty() && syncFailed.contains(syncNames[i]))
+                appendLog(tr("Art-Net→DMX: 打开串口 %1 失败 (输出 %2)")
+                              .arg(syncNames[i]).arg(i + 1), "error");
             continue;
         }
-        auto *sender = new Dmx512Sender(this);
-        if (!sender->open(portName)) {
-            appendLog(tr("Art-Net→DMX: 打开串口 %1 失败 (输出 %2)").arg(portName).arg(i + 1),
-                      "error");
-            delete sender;
-            continue;
-        }
-        row.sender = sender;
+        m_brOuts[i].slot = i;
         ++opened;
         openedDesc << tr("输出%1 %2 域%3起×%4")
-                      .arg(i + 1).arg(portName)
-                      .arg(row.spinStart->value()).arg(row.spinSpan->value());
+                      .arg(i + 1).arg(syncNames[i])
+                      .arg(m_brOuts[i].spinStart->value()).arg(m_brOuts[i].spinSpan->value());
     }
     if (opened == 0) {
         appendLog(tr("Art-Net→DMX: 没有成功打开的 DMX 输出串口, 请检查启用行与端口选择"), "error");
+        m_brGroup.stop();
         return;
     }
 
@@ -4192,17 +4197,16 @@ void ArtNetRecorderMainWindow::startArtToDmx() {
 
 void ArtNetRecorderMainWindow::stopArtToDmx() {
     if (m_brTickTimer) m_brTickTimer->stop();
+    m_brGroup.stop();
     if (m_brSocket) {
         m_brSocket->close();
         m_brSocket->deleteLater();
         m_brSocket = nullptr;
     }
     for (int i = 0; i < kArtToDmxOuts; ++i) {
-        if (m_brOuts[i].sender) {
-            m_brOuts[i].sender->close();
-            m_brOuts[i].sender->deleteLater();
-            m_brOuts[i].sender = nullptr;
-        }
+        m_brOuts[i].slot = -1;
+        m_brOuts[i].dirty = false;
+        m_brOuts[i].frame.clear();
     }
     if (m_btnBrToggle) m_btnBrToggle->setText(tr("▶ 开始转换"));
     if (m_lblBrState)
@@ -4235,13 +4239,13 @@ void ArtNetRecorderMainWindow::onArtToDmxDatagram() {
         if (m_brLastDmx.size() < 512)
             m_brLastDmx.append(QByteArray(512 - m_brLastDmx.size(), 0));
 
-        // 路由: 第一个 启用 && sender 已打开 && universe ∈ [起始, 起始+覆盖数) 的行;
+        // 路由: 第一个 启用 && 同步槽位已打开 && universe ∈ [起始, 起始+覆盖数) 的行;
         // 只更新该行的帧缓存并置脏, 实际发送交给统一节拍 tickArtToDmxBatch
         int targetIdx = -1;
         for (int i = 0; i < kArtToDmxOuts; ++i) {
             ArtToDmxOutput &row = m_brOuts[i];
             if (!row.chkEnabled || !row.chkEnabled->isChecked()
-                || !row.sender || !row.sender->isOpen()) continue;
+                || row.slot < 0 || !m_brGroup.isOpen(row.slot)) continue;
             const int start = row.spinStart ? row.spinStart->value() : 0;
             const int span  = row.spinSpan  ? row.spinSpan->value()  : 1;
             if (int(uni) >= start && int(uni) < start + span) { targetIdx = i; break; }
@@ -4257,20 +4261,25 @@ void ArtNetRecorderMainWindow::onArtToDmxDatagram() {
     }
 }
 
-// 统一节拍批量发送: 对每个脏行做一次非阻塞 sendFrameAsync, 串口忙 (上一帧未发完)
-// 则保留脏标志下个节拍重试; 同 tick 内连续写 8 口, BREAK 偏差仅为一帧写入耗时
+// 统一节拍批量发送: 把全部槽位的最新帧缓存一次性提交给同步发送组,
+// 各端口 worker 线程自旋等待到同一绝对时刻 (QPC) 齐发 BREAK, 偏差数十微秒级;
+// 提前量 1500μs 吸收线程唤醒延迟, 节拍本身仍与网络包到达解耦
+static constexpr quint64 kDmxSyncLeadUs = 1500;
+
 void ArtNetRecorderMainWindow::tickArtToDmxBatch() {
+    if (!m_brGroup.isRunning()) return;
+    QVector<QByteArray> frames(m_brGroup.count());
     const qint64 nowUs = QDateTime::currentMSecsSinceEpoch() * 1000;
     for (int i = 0; i < kArtToDmxOuts; ++i) {
         ArtToDmxOutput &row = m_brOuts[i];
-        if (!row.dirty) continue;
-        if (!row.sender || !row.sender->isOpen()) { row.dirty = false; continue; }
-        if (row.sender->sendFrameAsync(row.frame)) {
-            row.dirty = false;
+        if (row.slot < 0) continue;
+        frames[row.slot] = row.frame;   // 空缓存 = 发全零帧, 保持 DMX 连续刷新
+        if (row.dirty) {
             m_brLastLatencyUs = nowUs - row.arrivedUs;
+            row.dirty = false;
         }
-        // 忙: 保留 dirty, 下个节拍重试
     }
+    m_brGroup.commit(frames, DmxSyncGroup::nowUs() + kDmxSyncLeadUs);
 }
 
 QWidget *ArtNetRecorderMainWindow::buildPageArtToDmx() {
@@ -4281,9 +4290,10 @@ QWidget *ArtNetRecorderMainWindow::buildPageArtToDmx() {
 
     auto *hint = new QLabel(tr("Art-Net → DMX512 转换测试 — 监听 ArtDMX 数据报, 支持最多 8 路 DMX 串口输出; "
                                "每行按「起始 Universe + 覆盖域数」划分域段, 收到帧后路由到第一个匹配段所属串口 "
-                               "(同一帧只发一路, 不匹配任何启用段的帧计入丢弃). 发送采用统一节拍批量非阻塞模式: "
-                               "收包只更新各串口帧缓存, 23ms 定时器 (~43Hz) 一次性把全部脏串口异步写出, "
-                               "8 路 BREAK 起始偏差约 1ms 内, 与网络包到达时刻解耦. BREAK/MAB 由发送器按 "
+                               "(同一帧只发一路, 不匹配任何启用段的帧计入丢弃). 发送采用多线程绝对时刻同步模式: "
+                               "收包只更新各串口帧缓存, 23ms 定时器 (~43Hz) 统一提交目标时刻, "
+                               "每口独立 worker 线程自旋到同一 QPC 时刻齐发 BREAK, 8 路偏差数十微秒级, "
+                               "与网络包到达时刻解耦. BREAK/MAB 由发送器按 "
                                "250000 8N2 标准自动处理. 可用本机「Art-Net 测试」页发送数据来自环验证."));
     hint->setWordWrap(true);
     hint->setStyleSheet("color:#8fb3d9; font-size:12px;");
@@ -4407,11 +4417,11 @@ QWidget *ArtNetRecorderMainWindow::buildPageArtToDmx() {
     addStatTask(page, [this]{
         quint64 totalTx = 0;
         for (int i = 0; i < kArtToDmxOuts; ++i) {
-            const quint64 sent = m_brOuts[i].sender ? m_brOuts[i].sender->totalSentFrames() : 0;
+            const quint64 sent = m_brGroup.framesSent(m_brOuts[i].slot);
             totalTx += sent;
             if (m_brOuts[i].lblSent)
-                m_brOuts[i].lblSent->setText(m_brOuts[i].sender ? QString::number(sent)
-                                                                : QStringLiteral("--"));
+                m_brOuts[i].lblSent->setText(m_brOuts[i].slot >= 0 ? QString::number(sent)
+                                                                   : QStringLiteral("--"));
         }
         if (m_lblBrRxFrames) m_lblBrRxFrames->setText(QString::number(m_brRxCount));
         if (m_lblBrTxFrames) m_lblBrTxFrames->setText(QString::number(totalTx));
@@ -4812,33 +4822,36 @@ void ArtNetRecorderMainWindow::startNpuToDmx() {
     stopNpuToDmx();
     if (!m_np2dListenPort) return;
 
-    // 对每个"启用且选了串口"的行创建一个 Dmx512Sender 并 open;
-    // 单行失败只记日志, 不影响其余行
+    // 多线程绝对时刻同步发送组 (同 Art→DMX 页): 每口一个 worker 线程, 同一 QPC 时刻齐发 BREAK
+    QStringList syncNames;
+    for (int i = 0; i < kNp2dOuts; ++i) {
+        Np2dOutput &row = m_np2dOuts[i];
+        row.slot = -1;
+        const QString portName = (row.chkEnabled && row.chkEnabled->isChecked() && row.cmbPort)
+                                     ? row.cmbPort->currentData().toString() : QString();
+        if (row.chkEnabled && row.chkEnabled->isChecked() && portName.isEmpty())
+            appendLog(tr("NPU→DMX: 输出 %1 已启用但未选择串口").arg(i + 1), "warn");
+        syncNames << portName;
+    }
+    const QStringList syncFailed = m_np2dGroup.start(syncNames);
     int opened = 0;
     QStringList openedDesc;
     for (int i = 0; i < kNp2dOuts; ++i) {
-        Np2dOutput &row = m_np2dOuts[i];
-        if (!row.chkEnabled || !row.chkEnabled->isChecked()) continue;
-        const QString portName = row.cmbPort ? row.cmbPort->currentData().toString() : QString();
-        if (portName.isEmpty()) {
-            appendLog(tr("NPU→DMX: 输出 %1 已启用但未选择串口").arg(i + 1), "warn");
+        if (syncNames[i].isEmpty() || syncFailed.contains(syncNames[i])) {
+            if (!syncNames[i].isEmpty() && syncFailed.contains(syncNames[i]))
+                appendLog(tr("NPU→DMX: 打开串口 %1 失败 (输出 %2)")
+                              .arg(syncNames[i]).arg(i + 1), "error");
             continue;
         }
-        auto *sender = new Dmx512Sender(this);
-        if (!sender->open(portName)) {
-            appendLog(tr("NPU→DMX: 打开串口 %1 失败 (输出 %2)").arg(portName).arg(i + 1),
-                      "error");
-            delete sender;
-            continue;
-        }
-        row.sender = sender;
+        m_np2dOuts[i].slot = i;
         ++opened;
         openedDesc << tr("输出%1 %2 域%3起×%4")
-                      .arg(i + 1).arg(portName)
-                      .arg(row.spinStart->value()).arg(row.spinSpan->value());
+                      .arg(i + 1).arg(syncNames[i])
+                      .arg(m_np2dOuts[i].spinStart->value()).arg(m_np2dOuts[i].spinSpan->value());
     }
     if (opened == 0) {
         appendLog(tr("NPU→DMX: 没有成功打开的 DMX 输出串口, 请检查启用行与端口选择"), "error");
+        m_np2dGroup.stop();
         return;
     }
 
@@ -4886,17 +4899,16 @@ void ArtNetRecorderMainWindow::startNpuToDmx() {
 
 void ArtNetRecorderMainWindow::stopNpuToDmx() {
     if (m_np2dTickTimer) m_np2dTickTimer->stop();
+    m_np2dGroup.stop();
     if (m_np2dSource) {
         m_np2dSource->stop();
         m_np2dSource->deleteLater();
         m_np2dSource = nullptr;
     }
     for (int i = 0; i < kNp2dOuts; ++i) {
-        if (m_np2dOuts[i].sender) {
-            m_np2dOuts[i].sender->close();
-            m_np2dOuts[i].sender->deleteLater();
-            m_np2dOuts[i].sender = nullptr;
-        }
+        m_np2dOuts[i].slot = -1;
+        m_np2dOuts[i].dirty = false;
+        m_np2dOuts[i].frame.clear();
     }
     if (m_btnNp2dToggle) m_btnNp2dToggle->setText(tr("▶ 开始转换"));
     if (m_lblNp2dState)
@@ -4911,13 +4923,13 @@ void ArtNetRecorderMainWindow::onNp2dFrame(const LightFrame &frame) {
     if (m_np2dLastDmx.size() < 512)
         m_np2dLastDmx.append(QByteArray(512 - m_np2dLastDmx.size(), 0));
 
-    // 路由: 第一个 启用 && sender 已打开 && universe ∈ [起始, 起始+覆盖数) 的行;
+    // 路由: 第一个 启用 && 同步槽位已打开 && universe ∈ [起始, 起始+覆盖数) 的行;
     // 只更新该行的帧缓存并置脏, 实际发送交给统一节拍 tickNp2dBatch
     int targetIdx = -1;
     for (int i = 0; i < kNp2dOuts; ++i) {
         Np2dOutput &row = m_np2dOuts[i];
         if (!row.chkEnabled || !row.chkEnabled->isChecked()
-            || !row.sender || !row.sender->isOpen()) continue;
+            || row.slot < 0 || !m_np2dGroup.isOpen(row.slot)) continue;
         const int start = row.spinStart ? row.spinStart->value() : 0;
         const int span  = row.spinSpan  ? row.spinSpan->value()  : 1;
         if (uni >= start && uni < start + span) { targetIdx = i; break; }
@@ -4932,16 +4944,17 @@ void ArtNetRecorderMainWindow::onNp2dFrame(const LightFrame &frame) {
                          QDateTime::currentMSecsSinceEpoch() * 1000);
 }
 
-// 统一节拍批量发送: 对每个脏行做一次非阻塞 sendFrameAsync, 串口忙则保留脏标志下个节拍重试
+// 统一节拍批量发送: 同 Art→DMX 页, 全部槽位在同一绝对时刻齐发 BREAK
 void ArtNetRecorderMainWindow::tickNp2dBatch() {
+    if (!m_np2dGroup.isRunning()) return;
+    QVector<QByteArray> frames(m_np2dGroup.count());
     for (int i = 0; i < kNp2dOuts; ++i) {
         Np2dOutput &row = m_np2dOuts[i];
-        if (!row.dirty) continue;
-        if (!row.sender || !row.sender->isOpen()) { row.dirty = false; continue; }
-        if (row.sender->sendFrameAsync(row.frame))
-            row.dirty = false;
-        // 忙: 保留 dirty, 下个节拍重试
+        if (row.slot < 0) continue;
+        frames[row.slot] = row.frame;   // 空缓存 = 发全零帧, 保持 DMX 连续刷新
+        row.dirty = false;
     }
+    m_np2dGroup.commit(frames, DmxSyncGroup::nowUs() + kDmxSyncLeadUs);
 }
 
 QWidget *ArtNetRecorderMainWindow::buildPageNpuToDmx() {
@@ -4953,8 +4966,9 @@ QWidget *ArtNetRecorderMainWindow::buildPageNpuToDmx() {
     auto *hint = new QLabel(tr("NPU → DMX512 转换测试 — 监听 MA NPU (Ma-Net2) DMX 数据包 (单播/广播, 默认 UDP 9999), "
                                "支持最多 8 路 DMX 串口输出; 每行按「起始 Universe (0..255) + 覆盖域数」划分域段, "
                                "收到帧后路由到第一个匹配段所属串口 (同一帧只发一路, 不匹配任何启用段的帧计入丢弃). "
-                               "发送采用统一节拍批量非阻塞模式: 收帧只更新各串口帧缓存, 23ms 定时器 (~43Hz) "
-                               "一次性把全部脏串口异步写出, 8 路 BREAK 起始偏差约 1ms 内. "
+                               "发送采用多线程绝对时刻同步模式: 收帧只更新各串口帧缓存, 23ms 定时器 (~43Hz) "
+                               "统一提交目标时刻, 每口独立 worker 线程自旋到同一 QPC 时刻齐发 BREAK, "
+                               "8 路偏差数十微秒级. "
                                "BREAK/MAB 由发送器按 250000 8N2 标准自动处理."));
     hint->setWordWrap(true);
     hint->setStyleSheet("color:#8fb3d9; font-size:12px;");
@@ -5070,11 +5084,11 @@ QWidget *ArtNetRecorderMainWindow::buildPageNpuToDmx() {
     addStatTask(page, [this]{
         quint64 totalTx = 0;
         for (int i = 0; i < kNp2dOuts; ++i) {
-            const quint64 sent = m_np2dOuts[i].sender ? m_np2dOuts[i].sender->totalSentFrames() : 0;
+            const quint64 sent = m_np2dGroup.framesSent(m_np2dOuts[i].slot);
             totalTx += sent;
             if (m_np2dOuts[i].lblSent)
-                m_np2dOuts[i].lblSent->setText(m_np2dOuts[i].sender ? QString::number(sent)
-                                                                    : QStringLiteral("--"));
+                m_np2dOuts[i].lblSent->setText(m_np2dOuts[i].slot >= 0 ? QString::number(sent)
+                                                                       : QStringLiteral("--"));
         }
         if (m_lblNp2dRxFrames) m_lblNp2dRxFrames->setText(QString::number(m_np2dRxCount));
         if (m_lblNp2dTxFrames) m_lblNp2dTxFrames->setText(QString::number(totalTx));

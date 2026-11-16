@@ -127,4 +127,52 @@ private:
     qint64 m_lastFrameStartUs = -1; // 最近一次异步帧入队时刻 (µs); -1 = 无
 };
 
+// ============================================================
+// DmxSyncGroup — 多端口 BREAK 绝对时刻同步发送组
+//
+// 方案 1+2 (GUI 线程 23ms 节拍批量 sendFrameAsync) 的端口偏差约 1ms,
+// 源于同 tick 内逐口执行 BREAK(100μs)+MAB(15μs) 忙等串行累加。
+// 本类为每个端口配一个独立 worker 线程 (线程内打开并独占 QSerialPort,
+// 规避跨线程串口亲和性问题), 协调者一次性发布 (各口帧数据, 统一绝对时刻),
+// 各线程自旋等待到同一 QPC 时刻后同时触发 BREAK, 端口间偏差降至数十微秒级。
+//
+// 典型用法 (23ms 节拍):
+//   targetUs = DmxSyncGroup::nowUs() + 1500;   // 预留唤醒+自旋余量
+//   group.commit(frames, targetUs);            // 立即返回, 各线程到点齐发
+// ============================================================
+class DmxSyncGroup {
+    Q_DISABLE_COPY(DmxSyncGroup)
+public:
+    DmxSyncGroup() = default;
+    ~DmxSyncGroup() { stop(); }
+
+    /**
+     * @brief 为每个端口名启动一个 worker 线程 (空名 = 空闲槽位, 线程直接退出)
+     * @return 打开失败的端口名列表 (空 = 全部成功); 已有运行中的组会先 stop
+     */
+    QStringList start(const QStringList &portNames, qint32 baudRate = 250000);
+
+    /// 停止全部 worker 并关闭串口 (可重复调用)
+    void stop();
+
+    bool isRunning() const { return m_running; }
+    int count() const { return int(m_workers.size()); }
+    bool isOpen(int i) const;
+    quint64 framesSent(int i) const;
+
+    /**
+     * @brief 发布本节拍: 槽 i 发送 frames[i] (不足 512 自动补零),
+     *        全部端口在绝对时刻 targetUs (nowUs() 时基) 同时发出 BREAK
+     */
+    void commit(const QVector<QByteArray> &frames, quint64 targetUs);
+
+    /// 单调时钟绝对时刻 (μs), 与 commit 的 targetUs 同时基
+    static quint64 nowUs();
+
+private:
+    class Impl;   // 单端口 worker 线程 (定义在 .cpp)
+    QVector<Impl*> m_workers;
+    bool m_running = false;
+};
+
 #endif // DMX512_SENDER_H
