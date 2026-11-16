@@ -19,6 +19,8 @@
 #include <QJsonObject>
 #include <QCoreApplication>
 #include "output/ArtNetSender.h"
+#include "output/Dmx512Sender.h"
+#include "protocol/sources/NpuSource.h"
 #include <cstring>
 
 #ifdef Q_OS_WIN
@@ -730,7 +732,7 @@ ArtNetRecorderMainWindow::~ArtNetRecorderMainWindow() {
 // 重写 TestWindowBase::setupContent — 搭建左侧导航 + 右侧 Stacked
 // ============================================================
 void ArtNetRecorderMainWindow::setupContent() {
-    resize(1440, 960);
+    resize(1280, 800);
 
     // 复用 TestWindowBase 已安装在 m_contentArea 上的 QVBoxLayout (0 边距)
     // 注意: 不能对同一 QWidget 重复 new QLayout / delete 已安装的 layout,
@@ -807,6 +809,7 @@ void ArtNetRecorderMainWindow::setupContent() {
     m_stack->addWidget(wrapScroll(buildPageDmxTest()));     // DMX512 专项测试
     m_stack->addWidget(wrapScroll(buildPageArtToDmx()));    // Art-Net → DMX512 转换测试
     m_stack->addWidget(wrapScroll(buildPageDmxToArt()));    // DMX512 → Art-Net 转换测试
+    m_stack->addWidget(wrapScroll(buildPageNpuToDmx()));    // NPU → DMX512 转换测试
     m_stack->addWidget(wrapScroll(buildPageOutput()));      // 转发输出 (老页面, 保留)
     m_stack->addWidget(wrapScroll(buildPageFileMgr()));
     m_stack->addWidget(wrapScroll(buildPageSystem()));
@@ -826,9 +829,10 @@ void ArtNetRecorderMainWindow::setupContent() {
         {tr("🔌  DMX512 测试"), 10},
         {tr("🔄  Art-Net 转 DMX"), 11},
         {tr("🔄  DMX 转 Art-Net"), 12},
-        {tr("📡  转发输出"),    13},
-        {tr("💾  文件管理"),    14},
-        {tr("⚙   系统状态"),    15},
+        {tr("🔄  NPU 转 DMX"),  13},
+        {tr("📡  转发输出"),    14},
+        {tr("💾  文件管理"),    15},
+        {tr("⚙   系统状态"),    16},
     };
     for (const auto &pair : navItems) {
         auto *item = new QListWidgetItem(pair.first);
@@ -2137,27 +2141,42 @@ static void resetNetTestCounters(NetTestPage *p) {
 }
 
 static void fillNetTestPattern(NetTestPage *p, qint64 nowMs) {
-    const int mode = p->cmbMode ? p->cmbMode->currentIndex() : 0;   // 0 恒值 1 扫描 2 走灯
+    // 0 恒值 1 单通道扫描 2 逐通道走灯 3 全通道阶梯 4 全通道恒值渐变 5 分组扫描(8×64)
+    const int mode = p->cmbMode ? p->cmbMode->currentIndex() : 0;
     const int ch = p->spinChannel ? (p->spinChannel->value() - 1) : 0;
     const int stepMs = p->spinStepMs ? p->spinStepMs->value() : 100;
+    const bool stepDue = (nowMs - p->lastStepMs >= stepMs);
+    if (stepDue) p->lastStepMs = nowMs;
 
     p->txBuf.fill(0);
     if (mode == 0) {
         if (ch >= 0 && ch < 512) p->txBuf[ch] = char(p->spinLevel->value());
     } else if (mode == 1) {
-        if (nowMs - p->lastStepMs >= stepMs) {
-            p->lastStepMs = nowMs;
-            p->scanCh = (p->scanCh + 1) % 512;
-        }
+        if (stepDue) p->scanCh = (p->scanCh + 1) % 512;
         p->txBuf[p->scanCh] = char(255);
-    } else {
-        if (nowMs - p->lastStepMs >= stepMs) {
-            p->lastStepMs = nowMs;
+    } else if (mode == 2) {
+        if (stepDue) {
             p->ramp += p->rampUp ? 5 : -5;
             if (p->ramp >= 255) { p->ramp = 255; p->rampUp = false; }
             if (p->ramp <= 0)   { p->ramp = 0;   p->rampUp = true; }
         }
         if (ch >= 0 && ch < 512) p->txBuf[ch] = char(p->ramp);
+    } else if (mode == 3) {
+        // 512 通道全阶梯: 0..255 循环两轮, 校验全通道数据完整性
+        for (int i = 0; i < 512; ++i) p->txBuf[i] = char(i & 0xFF);
+    } else if (mode == 4) {
+        // 512 通道同步渐变: 全部通道一起升降
+        if (stepDue) {
+            p->ramp += p->rampUp ? 5 : -5;
+            if (p->ramp >= 255) { p->ramp = 255; p->rampUp = false; }
+            if (p->ramp <= 0)   { p->ramp = 0;   p->rampUp = true; }
+        }
+        p->txBuf.fill(char(p->ramp));
+    } else {
+        // 8 组 × 64 通道分组扫描: 当前组 64 通道全亮, 依次轮转
+        if (stepDue) p->scanCh = (p->scanCh + 1) % 8;
+        for (int i = p->scanCh * 64; i < p->scanCh * 64 + 64; ++i)
+            p->txBuf[i] = char(p->spinLevel ? p->spinLevel->value() : 255);
     }
 }
 
@@ -2321,24 +2340,33 @@ void ArtNetRecorderMainWindow::writeNetTestFrame(NetTestPage *p) {
     const QHostAddress target(p->editTargetIp->text().trimmed());
     if (target.isNull()) return;
 
-    const quint16 uni = quint16(p->spinUniverse->value());
-    QByteArray pkt;
-    if (p->type == ProtocolType::ArtNet) {
-        pkt = buildArtNetTestPacket(uni, p->txBuf, quint8(p->txCount & 0xFF));
-    } else if (p->type == ProtocolType::Sacn) {
-        const quint8 prio = quint8(p->spinPriority ? p->spinPriority->value() : 100);
-        pkt = buildE131Packet(uni, p->txBuf, p->cid, prio, quint8(p->txCount & 0xFF), 0);
-    } else {
-        pkt = buildNpuTestPacket(uni, p->txBuf);
+    const int uniMax = p->spinUniverse->maximum();
+    const int uniBase = p->spinUniverse->value();
+    const int uniCount = p->spinUniverseCount ? p->spinUniverseCount->value() : 1;
+    const bool feedOut = p->chkFeedOut && p->chkFeedOut->isChecked();
+    // 从起始域连续发送 N 个域 (8 域测试), 各域携带相同 512 通道图案
+    for (int k = 0; k < uniCount; ++k) {
+        const int u = uniBase + k;
+        if (u > uniMax) break;
+        const quint16 uni = quint16(u);
+        QByteArray pkt;
+        if (p->type == ProtocolType::ArtNet) {
+            pkt = buildArtNetTestPacket(uni, p->txBuf, quint8(p->txCount & 0xFF));
+        } else if (p->type == ProtocolType::Sacn) {
+            const quint8 prio = quint8(p->spinPriority ? p->spinPriority->value() : 100);
+            pkt = buildE131Packet(uni, p->txBuf, p->cid, prio, quint8(p->txCount & 0xFF), 0);
+        } else {
+            pkt = buildNpuTestPacket(uni, p->txBuf);
+        }
+
+        const qint64 sent = p->txSocket->writeDatagram(pkt, target, quint16(p->spinTargetPort->value()));
+        if (sent <= 0) return;
+
+        p->txCount++;
+        p->lastUniverse = uni;
+        if (feedOut)
+            feedLiveUniverse(false, uni, p->txBuf, nowMs * 1000);
     }
-
-    const qint64 sent = p->txSocket->writeDatagram(pkt, target, quint16(p->spinTargetPort->value()));
-    if (sent <= 0) return;
-
-    p->txCount++;
-    p->lastUniverse = uni;
-    if (p->chkFeedOut && p->chkFeedOut->isChecked())
-        feedLiveUniverse(false, uni, p->txBuf, nowMs * 1000);
 }
 
 void ArtNetRecorderMainWindow::onNetTestRx(NetTestPage *p) {
@@ -2442,7 +2470,8 @@ void ArtNetRecorderMainWindow::updateNetTestStats(NetTestPage *p) {
                            .arg((3000 - elapsed + 999) / 1000);
                 state = 1;
             } else {
-                const double fpsSet  = p->spinFrameRate ? p->spinFrameRate->value() : 0.0;
+                const double fpsSet  = (p->spinFrameRate ? p->spinFrameRate->value() : 0.0)
+                                     * double(p->spinUniverseCount ? p->spinUniverseCount->value() : 1);
                 const double fpsAvg  = elapsed > 0 ? p->rxCount * 1000.0 / double(elapsed) : 0.0;
                 const bool okCount = p->txCount > 0 && (p->rxCount + 2 >= p->txCount);
                 const bool okRate  = fpsAvg > 0
@@ -2525,6 +2554,11 @@ QWidget *ArtNetRecorderMainWindow::buildPageNetTest(ProtocolType type) {
     p->spinUniverse = new QSpinBox;
     p->spinUniverse->setRange(0, isArtNet ? 32767 : (isSacn ? 63999 : 255));
     p->spinUniverse->setValue(isSacn ? 1 : 0);
+    p->spinUniverseCount = new QSpinBox;
+    p->spinUniverseCount->setRange(1, 8);
+    p->spinUniverseCount->setValue(1);
+    p->spinUniverseCount->setSuffix(tr(" 域"));
+    p->spinUniverseCount->setToolTip(tr("从起始域开始连续发送 N 个域 (含 8 域测试); 回环接收率 = 刷新率 × 域数"));
     p->spinFrameRate = new QSpinBox;
     p->spinFrameRate->setRange(1, 100);
     p->spinFrameRate->setValue(40);
@@ -2533,6 +2567,9 @@ QWidget *ArtNetRecorderMainWindow::buildPageNetTest(ProtocolType type) {
     p->cmbMode->addItem(tr("恒值输出"));
     p->cmbMode->addItem(tr("单通道扫描"));
     p->cmbMode->addItem(tr("逐通道走灯"));
+    p->cmbMode->addItem(tr("全通道阶梯 (512)"));
+    p->cmbMode->addItem(tr("全通道渐变 (512)"));
+    p->cmbMode->addItem(tr("分组扫描 (8×64)"));
     p->spinChannel = new QSpinBox; p->spinChannel->setRange(1, 512); p->spinChannel->setValue(1);
     p->spinLevel = new QSpinBox;   p->spinLevel->setRange(0, 255);  p->spinLevel->setValue(255);
     p->spinStepMs = new QSpinBox;  p->spinStepMs->setRange(10, 5000); p->spinStepMs->setValue(100);
@@ -2554,8 +2591,10 @@ QWidget *ArtNetRecorderMainWindow::buildPageNetTest(ProtocolType type) {
     cfg->addWidget(p->spinTargetPort, 0, 3);
     cfg->addWidget(new QLabel(tr("接收端口:")), 0, 4);
     cfg->addWidget(p->spinListenPort, 0, 5);
-    cfg->addWidget(new QLabel(isArtNet ? tr("域 (Universe):") : tr("Universe:")), 0, 6);
+    cfg->addWidget(new QLabel(isArtNet ? tr("起始域:") : tr("Universe:")), 0, 6);
     cfg->addWidget(p->spinUniverse, 0, 7);
+    cfg->addWidget(new QLabel(tr("域数量:")), 0, 8);
+    cfg->addWidget(p->spinUniverseCount, 0, 9);
 
     cfg->addWidget(new QLabel(tr("刷新率:")), 1, 0);
     cfg->addWidget(p->spinFrameRate, 1, 1);
@@ -2963,66 +3002,138 @@ QWidget *ArtNetRecorderMainWindow::buildPageRdmTest() {
 
 // ============================================================
 // 页面: Art-Net → DMX512 转换测试
-//   接收 ArtDMX 数据报, 按所选域过滤后转成 DMX512 串口帧发出.
+//   接收 ArtDMX 数据报, 按 8 路输出的域段映射转成 DMX512 串口帧发出.
 // ============================================================
 void ArtNetRecorderMainWindow::refreshArtToDmxPorts() {
-    if (!m_brSerialPort) return;
-    const QString keep = m_brSerialPort->currentData().toString();
-    m_brSerialPort->clear();
+    // 一次枚举, 刷新全部 8 行的串口下拉, 尽量保留各行已选项
+    QStringList keeps;
+    for (int i = 0; i < kArtToDmxOuts; ++i)
+        keeps << (m_brOuts[i].cmbPort ? m_brOuts[i].cmbPort->currentData().toString()
+                                      : QString());
     const auto ports = QSerialPortInfo::availablePorts();
-    for (const QSerialPortInfo &pi : ports) {
-        m_brSerialPort->addItem(pi.portName() + (pi.description().isEmpty()
-                                                     ? QString()
-                                                     : "  (" + pi.description() + ")"),
-                                pi.portName());
+    for (int i = 0; i < kArtToDmxOuts; ++i) {
+        QComboBox *cmb = m_brOuts[i].cmbPort;
+        if (!cmb) continue;
+        cmb->clear();
+        for (const QSerialPortInfo &pi : ports) {
+            cmb->addItem(pi.portName() + (pi.description().isEmpty()
+                                              ? QString()
+                                              : "  (" + pi.description() + ")"),
+                         pi.portName());
+        }
+        if (cmb->count() == 0)
+            cmb->addItem(tr("(无可用串口)"), QString());
+        const int idx = cmb->findData(keeps.at(i));
+        if (idx >= 0) cmb->setCurrentIndex(idx);
     }
-    if (m_brSerialPort->count() == 0)
-        m_brSerialPort->addItem(tr("(无可用串口)"), QString());
-    const int idx = m_brSerialPort->findData(keep);
-    if (idx >= 0) m_brSerialPort->setCurrentIndex(idx);
 }
 
 void ArtNetRecorderMainWindow::startArtToDmx() {
     stopArtToDmx();
-    if (!m_brSerialPort || !m_brBreakMode || !m_brListenPort || !m_brUniverse) return;
+    if (!m_brListenPort) return;
 
-    const QString portName = m_brSerialPort->currentData().toString();
-    if (portName.isEmpty()) {
-        appendLog(tr("Art-Net→DMX: 请先选择 DMX 输出串口"), "error");
-        return;
+    // 对每个"启用且选了串口"的行创建一个 Dmx512Sender 并 open;
+    // 单行失败只记警告, 不影响其余行
+    int opened = 0;
+    QStringList openedDesc;
+    for (int i = 0; i < kArtToDmxOuts; ++i) {
+        ArtToDmxOutput &row = m_brOuts[i];
+        if (!row.chkEnabled || !row.chkEnabled->isChecked()) continue;
+        const QString portName = row.cmbPort ? row.cmbPort->currentData().toString() : QString();
+        if (portName.isEmpty()) {
+            appendLog(tr("Art-Net→DMX: 输出 %1 已启用但未选择串口").arg(i + 1), "warn");
+            continue;
+        }
+        auto *sender = new Dmx512Sender(this);
+        if (!sender->open(portName)) {
+            appendLog(tr("Art-Net→DMX: 打开串口 %1 失败 (输出 %2)").arg(portName).arg(i + 1),
+                      "error");
+            delete sender;
+            continue;
+        }
+        row.sender = sender;
+        ++opened;
+        openedDesc << tr("输出%1 %2 域%3起×%4")
+                      .arg(i + 1).arg(portName)
+                      .arg(row.spinStart->value()).arg(row.spinSpan->value());
     }
-
-    m_brSerial = new QSerialPort(this);
-    if (!openDmxPort(m_brSerial, portName)) {
-        appendLog(tr("Art-Net→DMX: 打开串口 %1 失败 (%2)").arg(portName, m_brSerial->errorString()),
-                  "error");
-        delete m_brSerial; m_brSerial = nullptr;
+    if (opened == 0) {
+        appendLog(tr("Art-Net→DMX: 没有成功打开的 DMX 输出串口, 请检查启用行与端口选择"), "error");
         return;
     }
 
     m_brSocket = new QUdpSocket(this);
     const quint16 port = quint16(m_brListenPort->value());
-    if (!m_brSocket->bind(QHostAddress::AnyIPv4, port,
+    QHostAddress bindAddr = QHostAddress::AnyIPv4;
+    QHostAddress joinGroup;   // 非空 = 监听 IP 填的是组播组地址
+    const QString ipText = m_brListenIp ? m_brListenIp->text().trimmed() : QString();
+    if (!ipText.isEmpty() && ipText != QLatin1String("0.0.0.0")) {
+        QHostAddress specific(ipText);
+        if (specific.isNull()) {
+            appendLog(tr("Art-Net→DMX: 监听 IP 无效: %1").arg(ipText), "error");
+            stopArtToDmx();
+            return;
+        }
+        const quint8 firstOctet = quint8(specific.toIPv4Address() >> 24);
+        if (firstOctet >= 224 && firstOctet <= 239) {
+            // 组播组地址: 绑 Any + 加组, 只收发往该组的包
+            joinGroup = specific;
+        } else {
+            bindAddr = specific;
+        }
+    }
+    if (!m_brSocket->bind(bindAddr, port,
                           QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
-        appendLog(tr("Art-Net→DMX: 绑定 UDP %1 失败 (%2)").arg(port).arg(m_brSocket->errorString()),
+        appendLog(tr("Art-Net→DMX: 绑定 UDP %1:%2 失败 (%3)")
+                      .arg(bindAddr.toString()).arg(port).arg(m_brSocket->errorString()),
                   "error");
         m_brSocket->deleteLater(); m_brSocket = nullptr;
-        m_brSerial->close(); m_brSerial->deleteLater(); m_brSerial = nullptr;
+        stopArtToDmx();
         return;
+    }
+    // Art-Net 标准组播 239.255.0.0: 未指定组播组时默认加该组, 否则收不到控台组播包;
+    // 绑定单播 IP 时广播 (255.255.255.255) 可能收不到, 建议用 0.0.0.0 或组播组地址
+    {
+        const QHostAddress group = joinGroup.isNull()
+            ? QHostAddress(QStringLiteral("239.255.0.0")) : joinGroup;
+        bool joined;
+        if (bindAddr == QHostAddress::AnyIPv4) {
+            joined = m_brSocket->joinMulticastGroup(group);
+        } else {
+            // 指定网卡 IP: 在该接口上加组
+            QNetworkInterface iface;
+            const QList<QNetworkInterface> ifaces = QNetworkInterface::allInterfaces();
+            for (const QNetworkInterface &ni : ifaces) {
+                const bool hit = std::any_of(ni.addressEntries().constBegin(),
+                                             ni.addressEntries().constEnd(),
+                                             [&bindAddr](const QNetworkAddressEntry &e) {
+                                                 return e.ip() == bindAddr;
+                                             });
+                if (hit) { iface = ni; break; }
+            }
+            joined = iface.isValid() ? m_brSocket->joinMulticastGroup(group, iface)
+                                     : m_brSocket->joinMulticastGroup(group);
+        }
+        appendLog(joined
+            ? tr("Art-Net→DMX: 已监听 %1:%2, 加入组播组 %3")
+                  .arg(bindAddr.toString()).arg(port).arg(group.toString())
+            : tr("Art-Net→DMX: 已监听 %1:%2, 但加入组播组 %3 失败 (仅收单播/广播)")
+                  .arg(bindAddr.toString()).arg(port).arg(group.toString()),
+            joined ? "info" : "warn");
     }
     connect(m_brSocket, &QUdpSocket::readyRead, this, [this]{ onArtToDmxDatagram(); });
 
-    m_brRxCount = m_brTxCount = m_brDropCount = 0;
+    m_brRxCount = m_brDropCount = 0;
     m_brLastLatencyUs = 0;
     m_brLastUni = 0;
     m_brLastDmx.clear();
 
     m_btnBrToggle->setText(tr("■ 停止转换"));
     m_lblBrState->setText(tr("<span style='color:#00e676'>转换中</span> "
-                             "<span style='color:#8fb3d9'>UDP %1 → %2 · 域 %3</span>")
-                              .arg(port).arg(portName).arg(m_brUniverse->value()));
-    appendLog(tr("Art-Net→DMX: 已开始 UDP %1 → %2 (250000 8N2, 域 %3)")
-                  .arg(port).arg(portName).arg(m_brUniverse->value()), "info");
+                             "<span style='color:#8fb3d9'>UDP %1 · %2 路串口输出</span>")
+                              .arg(port).arg(opened));
+    appendLog(tr("Art-Net→DMX: 已开始 UDP %1 → %2 路串口 (250000 8N2): %3")
+                  .arg(port).arg(opened).arg(openedDesc.join(", ")), "info");
 }
 
 void ArtNetRecorderMainWindow::stopArtToDmx() {
@@ -3031,10 +3142,12 @@ void ArtNetRecorderMainWindow::stopArtToDmx() {
         m_brSocket->deleteLater();
         m_brSocket = nullptr;
     }
-    if (m_brSerial) {
-        m_brSerial->close();
-        m_brSerial->deleteLater();
-        m_brSerial = nullptr;
+    for (int i = 0; i < kArtToDmxOuts; ++i) {
+        if (m_brOuts[i].sender) {
+            m_brOuts[i].sender->close();
+            m_brOuts[i].sender->deleteLater();
+            m_brOuts[i].sender = nullptr;
+        }
     }
     if (m_btnBrToggle) m_btnBrToggle->setText(tr("▶ 开始转换"));
     if (m_lblBrState)
@@ -3042,7 +3155,7 @@ void ArtNetRecorderMainWindow::stopArtToDmx() {
 }
 
 void ArtNetRecorderMainWindow::onArtToDmxDatagram() {
-    if (!m_brSocket || !m_brSerial) return;
+    if (!m_brSocket) return;
 
     while (m_brSocket->hasPendingDatagrams()) {
         const qint64 sz = m_brSocket->pendingDatagramSize();
@@ -3058,11 +3171,6 @@ void ArtNetRecorderMainWindow::onArtToDmxDatagram() {
         if (quint16(d[8] | (d[9] << 8)) != ArtNet::OP_DMX) { ++m_brDropCount; continue; }
 
         const quint16 uni = quint16(d[14] | ((d[15] & 0x7F) << 8));
-        if (m_brFilterUni && m_brFilterUni->isChecked()
-            && uni != quint16(m_brUniverse->value())) {
-            ++m_brDropCount;
-            continue;
-        }
         const int len = int(d[16] | (d[17] << 8));
         if (len <= 0) { ++m_brDropCount; continue; }
 
@@ -3072,39 +3180,23 @@ void ArtNetRecorderMainWindow::onArtToDmxDatagram() {
         if (m_brLastDmx.size() < 512)
             m_brLastDmx.append(QByteArray(512 - m_brLastDmx.size(), 0));
 
-        writeArtToDmxFrame(m_brLastDmx);
+        // 路由: 第一个 启用 && sender 已打开 && universe ∈ [起始, 起始+覆盖数) 的行
+        Dmx512Sender *target = nullptr;
+        for (int i = 0; i < kArtToDmxOuts; ++i) {
+            ArtToDmxOutput &row = m_brOuts[i];
+            if (!row.chkEnabled || !row.chkEnabled->isChecked()
+                || !row.sender || !row.sender->isOpen()) continue;
+            const int start = row.spinStart ? row.spinStart->value() : 0;
+            const int span  = row.spinSpan  ? row.spinSpan->value()  : 1;
+            if (int(uni) >= start && int(uni) < start + span) { target = row.sender; break; }
+        }
+        if (!target) { ++m_brDropCount; continue; }
+
+        target->sendFrame(m_brLastDmx);
         m_brLastLatencyUs = QDateTime::currentMSecsSinceEpoch() * 1000 - recvUs;
         if (m_brFeedOut && m_brFeedOut->isChecked())
             feedLiveUniverse(false, uni, m_brLastDmx, recvUs);
     }
-}
-
-void ArtNetRecorderMainWindow::writeArtToDmxFrame(const QByteArray &dmx) {
-    if (!m_brSerial || !m_brSerial->isOpen()) return;
-
-    const int bm = m_brBreakMode ? m_brBreakMode->currentIndex() : 0;
-    if (bm == 0) {
-        m_brSerial->setBreakEnabled(true);
-        QThread::usleep(120);
-        m_brSerial->setBreakEnabled(false);
-        QThread::usleep(12);
-    } else if (bm == 1) {
-        m_brSerial->setBaudRate(57600);
-        m_brSerial->write(QByteArray(1, char(0x00)));
-        m_brSerial->flush();
-        QThread::usleep(250);
-        m_brSerial->setBaudRate(250000);
-        QThread::usleep(30);
-    }
-
-    QByteArray frame;
-    frame.reserve(513);
-    frame.append(char(0x00));                 // 起始码
-    frame.append(dmx.left(512));
-    if (frame.size() < 513) frame.append(QByteArray(513 - frame.size(), 0));
-    m_brSerial->write(frame);
-    m_brSerial->flush();
-    m_brTxCount++;
 }
 
 QWidget *ArtNetRecorderMainWindow::buildPageArtToDmx() {
@@ -3113,64 +3205,95 @@ QWidget *ArtNetRecorderMainWindow::buildPageArtToDmx() {
     root->setContentsMargins(0, 0, 0, 0);
     root->setSpacing(10);
 
-    auto *hint = new QLabel(tr("Art-Net → DMX512 转换测试 — 监听 ArtDMX 数据报, 按域过滤后立即转成 DMX512 串口帧发送; "
-                               "转换延迟即为单帧处理耗时. 可用本机「Art-Net 测试」页发送数据来自环验证."));
+    auto *hint = new QLabel(tr("Art-Net → DMX512 转换测试 — 监听 ArtDMX 数据报, 支持最多 8 路 DMX 串口输出; "
+                               "每行按「起始 Universe + 覆盖域数」划分域段, 收到帧后路由到第一个匹配段所属串口 "
+                               "(同一帧只发一路, 不匹配任何启用段的帧计入丢弃). BREAK/MAB 由发送器按 250000 8N2 "
+                               "标准自动处理. 可用本机「Art-Net 测试」页发送数据来自环验证."));
     hint->setWordWrap(true);
     hint->setStyleSheet("color:#8fb3d9; font-size:12px;");
     root->addWidget(hint);
 
     auto *cfgBody = new QWidget;
-    auto *cfg = new QGridLayout(cfgBody);
+    auto *cfg = new QVBoxLayout(cfgBody);
     cfg->setContentsMargins(0, 0, 0, 0);
-    cfg->setHorizontalSpacing(12);
-    cfg->setVerticalSpacing(8);
+    cfg->setSpacing(8);
 
+    // ---- 顶部: 监听端口 / 输出选项 / 刷新 ----
+    auto *rowTop = new QHBoxLayout;
+    rowTop->setContentsMargins(0, 0, 0, 0);
+    m_brListenIp = new QLineEdit; m_brListenIp->setText("0.0.0.0");
+    m_brListenIp->setPlaceholderText(tr("0.0.0.0 / 本机 IP / 组播组 239.255.0.0"));
+    m_brListenIp->setToolTip(tr("接收 Art-Net 包的本地监听地址:<br>"
+        "0.0.0.0 = 所有网卡 (单播+广播, 并自动加入组播组 239.255.0.0)<br>"
+        "本机网卡 IP = 只收发往该地址的单播包<br>"
+        "239.x.x.x = 组播组地址, 只收发往该组的组播包<br>"
+        "修改后需重启桥接生效"));
+    m_brListenIp->setFixedWidth(120);
     m_brListenPort = new QSpinBox; m_brListenPort->setRange(1, 65535); m_brListenPort->setValue(6454);
-    m_brUniverse   = new QSpinBox; m_brUniverse->setRange(0, 32767);  m_brUniverse->setValue(0);
-    m_brUniverse->setPrefix(tr("域 "));
-    m_brSerialPort = new QComboBox; m_brSerialPort->setMinimumWidth(170);
-    m_brBreakMode  = new QComboBox;
-    m_brBreakMode->addItem(tr("串口 Break（标准 DMX 接口）"));
-    m_brBreakMode->addItem(tr("波特率模拟（普通 RS485）"));
-    m_brBreakMode->addItem(tr("不发送 Break"));
-    m_brFilterUni = new QCheckBox(tr("只转发匹配域"));
-    m_brFilterUni->setChecked(true);
     m_brFeedOut   = new QCheckBox(tr("转换结果 → 实时输出页"));
     m_brFeedOut->setChecked(true);
-
     auto *btnRefresh = new QPushButton(tr("刷新端口"));
     btnRefresh->setProperty("action", "tool");
+    rowTop->addWidget(new QLabel(tr("监听 IP:")));
+    rowTop->addWidget(m_brListenIp);
+    rowTop->addSpacing(10);
+    rowTop->addWidget(new QLabel(tr("监听 UDP 端口:")));
+    rowTop->addWidget(m_brListenPort);
+    rowTop->addSpacing(18);
+    rowTop->addWidget(m_brFeedOut);
+    rowTop->addStretch();
+    rowTop->addWidget(btnRefresh);
+    cfg->addLayout(rowTop);
+
+    // ---- 输出配置表: 8 行 (启用 / 串口 / 起始 Universe / 覆盖域数 / 已发帧数) ----
+    auto *tbl = new QGridLayout;
+    tbl->setContentsMargins(0, 0, 0, 0);
+    tbl->setHorizontalSpacing(10);
+    tbl->setVerticalSpacing(6);
+
+    auto makeHead = [](const QString &t) {
+        auto *l = new QLabel(t);
+        l->setStyleSheet("color:#8fb3d9; font-size:12px;");
+        return l;
+    };
+    tbl->addWidget(makeHead(tr("#")),              0, 0);
+    tbl->addWidget(makeHead(tr("启用")),           0, 1);
+    tbl->addWidget(makeHead(tr("DMX 输出串口")),   0, 2);
+    tbl->addWidget(makeHead(tr("起始 Universe")),  0, 3);
+    tbl->addWidget(makeHead(tr("覆盖域数")),       0, 4);
+    tbl->addWidget(makeHead(tr("已发帧数")),       0, 5);
+
+    for (int i = 0; i < kArtToDmxOuts; ++i) {
+        ArtToDmxOutput &row = m_brOuts[i];
+        auto *idx = makeHead(QString::number(i + 1));
+        idx->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        row.chkEnabled = new QCheckBox;
+        row.chkEnabled->setChecked(i == 0);   // 第 1 行默认启用, 沿用原单串口默认值
+        row.cmbPort = new QComboBox; row.cmbPort->setMinimumWidth(170);
+        row.spinStart = new QSpinBox; row.spinStart->setRange(0, 32767); row.spinStart->setValue(i);
+        row.spinSpan  = new QSpinBox; row.spinSpan->setRange(1, 8);      row.spinSpan->setValue(1);
+        row.lblSent = new QLabel("--");
+        row.lblSent->setStyleSheet("color:#00d4ff; font-size:13px; font-weight:bold; font-family:Consolas;");
+        tbl->addWidget(idx, i + 1, 0);
+        tbl->addWidget(row.chkEnabled, i + 1, 1, Qt::AlignCenter);
+        tbl->addWidget(row.cmbPort, i + 1, 2);
+        tbl->addWidget(row.spinStart, i + 1, 3);
+        tbl->addWidget(row.spinSpan, i + 1, 4);
+        tbl->addWidget(row.lblSent, i + 1, 5);
+    }
+    tbl->setColumnStretch(6, 1);
+    cfg->addLayout(tbl);
+
     m_btnBrToggle = new QPushButton(tr("▶ 开始转换"));
     m_btnBrToggle->setProperty("action", "start");
     m_lblBrState = new QLabel(tr("<span style='color:#8fb3d9'>未启动</span>"));
-
-    cfg->addWidget(new QLabel(tr("监听 UDP 端口:")), 0, 0);
-    cfg->addWidget(m_brListenPort, 0, 1);
-    cfg->addWidget(new QLabel(tr("目标域:")), 0, 3);
-    cfg->addWidget(m_brUniverse, 0, 4);
-
-    cfg->addWidget(new QLabel(tr("DMX 输出串口:")), 1, 0);
-    cfg->addWidget(m_brSerialPort, 1, 1);
-    cfg->addWidget(btnRefresh, 1, 2);
-    cfg->addWidget(new QLabel(tr("Break 方式:")), 1, 3);
-    cfg->addWidget(m_brBreakMode, 1, 4);
-
-    auto *rowOpt = new QHBoxLayout;
-    rowOpt->setContentsMargins(0, 0, 0, 0);
-    rowOpt->addWidget(m_brFilterUni);
-    rowOpt->addSpacing(24);
-    rowOpt->addWidget(m_brFeedOut);
-    rowOpt->addStretch();
-    cfg->addLayout(rowOpt, 2, 0, 1, 5);
-
     auto *rowBtn = new QHBoxLayout;
     rowBtn->setContentsMargins(0, 0, 0, 0);
     rowBtn->addWidget(m_btnBrToggle);
     rowBtn->addWidget(m_lblBrState);
     rowBtn->addStretch();
-    cfg->addLayout(rowBtn, 3, 0, 1, 5);
+    cfg->addLayout(rowBtn);
 
-    cfg->setColumnStretch(4, 1);
     root->addWidget(createCard(tr("转换参数"), cfgBody), 0);
 
     // ---- 转换结果 ----
@@ -3206,8 +3329,16 @@ QWidget *ArtNetRecorderMainWindow::buildPageArtToDmx() {
 
     m_brStatTimer = new QTimer(this);
     connect(m_brStatTimer, &QTimer::timeout, this, [this]{
+        quint64 totalTx = 0;
+        for (int i = 0; i < kArtToDmxOuts; ++i) {
+            const quint64 sent = m_brOuts[i].sender ? m_brOuts[i].sender->totalSentFrames() : 0;
+            totalTx += sent;
+            if (m_brOuts[i].lblSent)
+                m_brOuts[i].lblSent->setText(m_brOuts[i].sender ? QString::number(sent)
+                                                                : QStringLiteral("--"));
+        }
         if (m_lblBrRxFrames) m_lblBrRxFrames->setText(QString::number(m_brRxCount));
-        if (m_lblBrTxFrames) m_lblBrTxFrames->setText(QString::number(m_brTxCount));
+        if (m_lblBrTxFrames) m_lblBrTxFrames->setText(QString::number(totalTx));
         if (m_lblBrDropped)  m_lblBrDropped->setText(QString::number(m_brDropCount));
         if (m_lblBrLastUni)  m_lblBrLastUni->setText(m_brRxCount ? QString::number(m_brLastUni) : "--");
         if (m_lblBrLatency)  m_lblBrLatency->setText(m_brLastLatencyUs > 0
@@ -3234,77 +3365,101 @@ QWidget *ArtNetRecorderMainWindow::buildPageArtToDmx() {
 
 // ============================================================
 // 页面: DMX512 → Art-Net 转换测试
-//   串口接收 DMX512 帧, 转成 ArtDMX 数据报送往目标地址.
+//   最多 8 路串口接收 DMX512 帧, 各行按目标域转成 ArtDMX 数据报送往全局目标地址.
 // ============================================================
 void ArtNetRecorderMainWindow::refreshD2aPorts() {
-    if (!m_d2aSerialPort) return;
-    const QString keep = m_d2aSerialPort->currentData().toString();
-    m_d2aSerialPort->clear();
+    // 一次枚举, 刷新全部 8 行的串口下拉, 尽量保留各行已选项
+    QStringList keeps;
+    for (int i = 0; i < kDmxToArtIns; ++i)
+        keeps << (m_d2aIns[i].cmbPort ? m_d2aIns[i].cmbPort->currentData().toString()
+                                      : QString());
     const auto ports = QSerialPortInfo::availablePorts();
-    for (const QSerialPortInfo &pi : ports) {
-        m_d2aSerialPort->addItem(pi.portName() + (pi.description().isEmpty()
-                                                      ? QString()
-                                                      : "  (" + pi.description() + ")"),
-                                 pi.portName());
+    for (int i = 0; i < kDmxToArtIns; ++i) {
+        QComboBox *cmb = m_d2aIns[i].cmbPort;
+        if (!cmb) continue;
+        cmb->clear();
+        for (const QSerialPortInfo &pi : ports) {
+            cmb->addItem(pi.portName() + (pi.description().isEmpty()
+                                              ? QString()
+                                              : "  (" + pi.description() + ")"),
+                         pi.portName());
+        }
+        if (cmb->count() == 0)
+            cmb->addItem(tr("(无可用串口)"), QString());
+        const int idx = cmb->findData(keeps.at(i));
+        if (idx >= 0) cmb->setCurrentIndex(idx);
     }
-    if (m_d2aSerialPort->count() == 0)
-        m_d2aSerialPort->addItem(tr("(无可用串口)"), QString());
-    const int idx = m_d2aSerialPort->findData(keep);
-    if (idx >= 0) m_d2aSerialPort->setCurrentIndex(idx);
 }
 
 void ArtNetRecorderMainWindow::startDmxToArt() {
     stopDmxToArt();
-    if (!m_d2aSerialPort || !m_d2aUniverse) return;
 
-    const QString portName = m_d2aSerialPort->currentData().toString();
-    if (portName.isEmpty()) {
-        appendLog(tr("DMX→Art-Net: 请先选择 DMX 输入串口"), "error");
+    // 对每个"启用且选了串口"的行开一个 QSerialPort; 单行失败只记日志, 不影响其余行
+    int opened = 0;
+    QStringList openedDesc;
+    for (int i = 0; i < kDmxToArtIns; ++i) {
+        DmxToArtInput &row = m_d2aIns[i];
+        row.accum.clear();
+        row.rxCount = 0;
+        row.seq = 0;
+        if (!row.chkEnabled || !row.chkEnabled->isChecked()) continue;
+        const QString portName = row.cmbPort ? row.cmbPort->currentData().toString() : QString();
+        if (portName.isEmpty()) {
+            appendLog(tr("DMX→Art-Net: 输入 %1 已启用但未选择串口").arg(i + 1), "warn");
+            continue;
+        }
+        row.serial = new QSerialPort(this);
+        if (!openDmxPort(row.serial, portName)) {
+            appendLog(tr("DMX→Art-Net: 打开串口 %1 失败 (输入 %2, %3)")
+                          .arg(portName, row.serial->errorString()).arg(i + 1), "error");
+            delete row.serial; row.serial = nullptr;
+            continue;
+        }
+        const int idx = i;
+        connect(row.serial, &QSerialPort::readyRead, this, [this, idx]{ onD2aSerialData(idx); });
+        ++opened;
+        openedDesc << tr("输入%1 %2 → 域%3")
+                      .arg(i + 1).arg(portName).arg(row.spinUni->value());
+    }
+    if (opened == 0) {
+        appendLog(tr("DMX→Art-Net: 没有成功打开的 DMX 输入串口, 请检查启用行与端口选择"), "error");
         return;
     }
-
-    m_d2aSerial = new QSerialPort(this);
-    if (!openDmxPort(m_d2aSerial, portName)) {
-        appendLog(tr("DMX→Art-Net: 打开串口 %1 失败 (%2)")
-                      .arg(portName, m_d2aSerial->errorString()), "error");
-        delete m_d2aSerial; m_d2aSerial = nullptr;
-        return;
-    }
-    connect(m_d2aSerial, &QSerialPort::readyRead, this, [this]{ onD2aSerialData(); });
 
     m_d2aSocket = new QUdpSocket(this);
     if (!m_d2aSocket->bind(QHostAddress(QHostAddress::AnyIPv4), 0)) {
         appendLog(tr("DMX→Art-Net: 创建发送 socket 失败"), "error");
         m_d2aSocket->deleteLater(); m_d2aSocket = nullptr;
-        m_d2aSerial->close(); m_d2aSerial->deleteLater(); m_d2aSerial = nullptr;
+        stopDmxToArt();
         return;
     }
 
-    m_d2aAccum.clear();
     m_d2aLastDmx.clear();
-    m_d2aRxCount = m_d2aTxCount = m_d2aDropCount = 0;
+    m_d2aTxCount = m_d2aDropCount = 0;
     m_d2aLatencyUs = 0;
-    m_d2aSeq = 0;
+    m_d2aLastUni = 0;
 
     m_btnD2aToggle->setText(tr("■ 停止转换"));
     m_lblD2aState->setText(tr("<span style='color:#00e676'>转换中</span> "
-                              "<span style='color:#8fb3d9'>%1 → UDP %2:%3 · 域 %4</span>")
-                               .arg(portName)
+                              "<span style='color:#8fb3d9'>%1 路串口 → UDP %2:%3</span>")
+                               .arg(opened)
                                .arg(m_d2aTargetIp->text().trimmed())
-                               .arg(m_d2aTargetPort->value())
-                               .arg(m_d2aUniverse->value()));
-    appendLog(tr("DMX→Art-Net: 已开始 %1 (250000 8N2) → %2:%3, 域 %4")
-                  .arg(portName)
+                               .arg(m_d2aTargetPort->value()));
+    appendLog(tr("DMX→Art-Net: 已开始 %1 路串口 (250000 8N2) → %2:%3: %4")
+                  .arg(opened)
                   .arg(m_d2aTargetIp->text().trimmed())
                   .arg(m_d2aTargetPort->value())
-                  .arg(m_d2aUniverse->value()), "info");
+                  .arg(openedDesc.join(", ")), "info");
 }
 
 void ArtNetRecorderMainWindow::stopDmxToArt() {
-    if (m_d2aSerial) {
-        m_d2aSerial->close();
-        m_d2aSerial->deleteLater();
-        m_d2aSerial = nullptr;
+    for (int i = 0; i < kDmxToArtIns; ++i) {
+        if (m_d2aIns[i].serial) {
+            m_d2aIns[i].serial->close();
+            m_d2aIns[i].serial->deleteLater();
+            m_d2aIns[i].serial = nullptr;
+        }
+        m_d2aIns[i].accum.clear();
     }
     if (m_d2aSocket) {
         m_d2aSocket->close();
@@ -3316,15 +3471,17 @@ void ArtNetRecorderMainWindow::stopDmxToArt() {
         m_lblD2aState->setText(tr("<span style='color:#8fb3d9'>未启动</span>"));
 }
 
-void ArtNetRecorderMainWindow::onD2aSerialData() {
-    if (!m_d2aSerial || !m_d2aSocket) return;
-    m_d2aAccum.append(m_d2aSerial->readAll());
+void ArtNetRecorderMainWindow::onD2aSerialData(int row) {
+    if (row < 0 || row >= kDmxToArtIns) return;
+    DmxToArtInput &in = m_d2aIns[row];
+    if (!in.serial || !m_d2aSocket) return;
+    in.accum.append(in.serial->readAll());
 
     const int fmt = m_d2aFormat ? m_d2aFormat->currentIndex() : 0;
     const int frameLen = (fmt == 1) ? 514 : (fmt == 2 ? 512 : 513);
 
-    while (m_d2aAccum.size() >= frameLen) {
-        const QByteArray frame = m_d2aAccum.left(frameLen);
+    while (in.accum.size() >= frameLen) {
+        const QByteArray frame = in.accum.left(frameLen);
         QByteArray dmx;
         if (frameLen == 512) {
             dmx = frame;
@@ -3332,34 +3489,35 @@ void ArtNetRecorderMainWindow::onD2aSerialData() {
             // 兼容起始码前多一个字节的适配器
             if (uchar(frame.at(0)) == 0x00)      dmx = frame.mid(1, 512);
             else if (uchar(frame.at(1)) == 0x00) dmx = frame.mid(2, 512);
-            else { m_d2aAccum.remove(0, 1); ++m_d2aDropCount; continue; }
+            else { in.accum.remove(0, 1); ++m_d2aDropCount; continue; }
         }
-        m_d2aAccum.remove(0, frameLen);
+        in.accum.remove(0, frameLen);
         if (dmx.size() < 512) dmx.append(QByteArray(512 - dmx.size(), 0));
 
         const qint64 nowUs = QDateTime::currentMSecsSinceEpoch() * 1000;
-        m_d2aRxCount++;
+        in.rxCount++;
         m_d2aLastDmx = dmx.left(512);
-        m_d2aLastUni = quint16(m_d2aUniverse->value());
+        m_d2aLastUni = quint16(in.spinUni ? in.spinUni->value() : 0);
 
         if (m_d2aFeedIn && m_d2aFeedIn->isChecked())
             feedLiveUniverse(true, m_d2aLastUni, m_d2aLastDmx, nowUs);
 
-        convertDmxToArt(m_d2aLastDmx);
+        convertDmxToArt(row, m_d2aLastDmx);
         m_d2aLatencyUs = QDateTime::currentMSecsSinceEpoch() * 1000 - nowUs;
     }
 
-    if (m_d2aAccum.size() > frameLen * 4)
-        m_d2aAccum = m_d2aAccum.right(frameLen * 2);
+    if (in.accum.size() > frameLen * 4)
+        in.accum = in.accum.right(frameLen * 2);
 }
 
-void ArtNetRecorderMainWindow::convertDmxToArt(const QByteArray &dmx) {
-    if (!m_d2aSocket) return;
+void ArtNetRecorderMainWindow::convertDmxToArt(int row, const QByteArray &dmx) {
+    if (!m_d2aSocket || row < 0 || row >= kDmxToArtIns) return;
     const QHostAddress target(m_d2aTargetIp ? m_d2aTargetIp->text().trimmed() : "127.0.0.1");
     if (target.isNull()) { ++m_d2aDropCount; return; }
 
-    const quint16 uni = quint16(m_d2aUniverse->value());
-    const QByteArray pkt = buildArtNetTestPacket(uni, dmx, m_d2aSeq++);
+    DmxToArtInput &in = m_d2aIns[row];
+    const quint16 uni = quint16(in.spinUni ? in.spinUni->value() : 0);
+    const QByteArray pkt = buildArtNetTestPacket(uni, dmx, in.seq++);
     const qint64 sent = m_d2aSocket->writeDatagram(
         pkt, target, quint16(m_d2aTargetPort ? m_d2aTargetPort->value() : 6454));
     if (sent <= 0) { ++m_d2aDropCount; return; }
@@ -3375,27 +3533,24 @@ QWidget *ArtNetRecorderMainWindow::buildPageDmxToArt() {
     root->setContentsMargins(0, 0, 0, 0);
     root->setSpacing(10);
 
-    auto *hint = new QLabel(tr("DMX512 → Art-Net 转换测试 — 串口接收 DMX512 帧 (250000 8N2), 转成 ArtDMX 数据报发出; "
-                               "每收到一帧立即转发. 可用本机「Art-Net 测试 → 接收测试」验证输出."));
+    auto *hint = new QLabel(tr("DMX512 → Art-Net 转换测试 — 支持最多 8 路 DMX 串口同时输入 (250000 8N2), "
+                               "每路按各自「目标 Universe」打包成 ArtDMX 数据报, 立即发往全局目标 IP:端口; "
+                               "帧格式与目标地址对所有输入行共用. 可用本机「Art-Net 测试 → 接收测试」验证输出."));
     hint->setWordWrap(true);
     hint->setStyleSheet("color:#8fb3d9; font-size:12px;");
     root->addWidget(hint);
 
     auto *cfgBody = new QWidget;
-    auto *cfg = new QGridLayout(cfgBody);
+    auto *cfg = new QVBoxLayout(cfgBody);
     cfg->setContentsMargins(0, 0, 0, 0);
-    cfg->setHorizontalSpacing(12);
-    cfg->setVerticalSpacing(8);
+    cfg->setSpacing(8);
 
-    m_d2aSerialPort = new QComboBox; m_d2aSerialPort->setMinimumWidth(170);
     m_d2aFormat = new QComboBox;
     m_d2aFormat->addItem(tr("513 字节（起始码 + 512 数据）"));
     m_d2aFormat->addItem(tr("514 字节（起始码前多 1 字节）"));
     m_d2aFormat->addItem(tr("512 字节（无起始码）"));
     m_d2aTargetIp = new QLineEdit("127.0.0.1"); m_d2aTargetIp->setMinimumWidth(140);
     m_d2aTargetPort = new QSpinBox; m_d2aTargetPort->setRange(1, 65535); m_d2aTargetPort->setValue(6454);
-    m_d2aUniverse = new QSpinBox; m_d2aUniverse->setRange(0, 32767); m_d2aUniverse->setValue(0);
-    m_d2aUniverse->setPrefix(tr("域 "));
     m_d2aFeedIn = new QCheckBox(tr("接收数据 → 实时输入页"));
     m_d2aFeedIn->setChecked(true);
     m_d2aFeedOut = new QCheckBox(tr("发送数据 → 实时输出页"));
@@ -3407,19 +3562,55 @@ QWidget *ArtNetRecorderMainWindow::buildPageDmxToArt() {
     m_btnD2aToggle->setProperty("action", "start");
     m_lblD2aState = new QLabel(tr("<span style='color:#8fb3d9'>未启动</span>"));
 
-    cfg->addWidget(new QLabel(tr("DMX 输入串口:")), 0, 0);
-    cfg->addWidget(m_d2aSerialPort, 0, 1);
-    cfg->addWidget(btnRefresh, 0, 2);
-    cfg->addWidget(new QLabel(tr("帧格式:")), 0, 3);
-    cfg->addWidget(m_d2aFormat, 0, 4);
+    // ---- 顶部: 全局目标地址 / 帧格式 / 刷新 ----
+    auto *rowTop = new QHBoxLayout;
+    rowTop->setContentsMargins(0, 0, 0, 0);
+    rowTop->addWidget(new QLabel(tr("目标 IP:")));
+    rowTop->addWidget(m_d2aTargetIp);
+    rowTop->addWidget(new QLabel(tr("目标端口:")));
+    rowTop->addWidget(m_d2aTargetPort);
+    rowTop->addSpacing(18);
+    rowTop->addWidget(new QLabel(tr("帧格式:")));
+    rowTop->addWidget(m_d2aFormat);
+    rowTop->addStretch();
+    rowTop->addWidget(btnRefresh);
+    cfg->addLayout(rowTop);
 
-    cfg->addWidget(new QLabel(tr("目标 IP:")), 1, 0);
-    cfg->addWidget(m_d2aTargetIp, 1, 1);
-    cfg->addWidget(new QLabel(tr("目标端口:")), 1, 3);
-    cfg->addWidget(m_d2aTargetPort, 1, 4);
+    // ---- 输入配置表: 8 行 (启用 / 串口 / 目标 Universe / 收到帧数) ----
+    auto *tbl = new QGridLayout;
+    tbl->setContentsMargins(0, 0, 0, 0);
+    tbl->setHorizontalSpacing(10);
+    tbl->setVerticalSpacing(6);
 
-    cfg->addWidget(new QLabel(tr("目标域:")), 2, 0);
-    cfg->addWidget(m_d2aUniverse, 2, 1);
+    auto makeHead = [](const QString &t) {
+        auto *l = new QLabel(t);
+        l->setStyleSheet("color:#8fb3d9; font-size:12px;");
+        return l;
+    };
+    tbl->addWidget(makeHead(tr("#")),               0, 0);
+    tbl->addWidget(makeHead(tr("启用")),            0, 1);
+    tbl->addWidget(makeHead(tr("DMX 输入串口")),    0, 2);
+    tbl->addWidget(makeHead(tr("目标 Universe")),   0, 3);
+    tbl->addWidget(makeHead(tr("收到帧数")),        0, 4);
+
+    for (int i = 0; i < kDmxToArtIns; ++i) {
+        DmxToArtInput &row = m_d2aIns[i];
+        auto *idx = makeHead(QString::number(i + 1));
+        idx->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        row.chkEnabled = new QCheckBox;
+        row.chkEnabled->setChecked(i == 0);   // 第 1 行默认启用, 沿用原单串口逻辑
+        row.cmbPort = new QComboBox; row.cmbPort->setMinimumWidth(170);
+        row.spinUni = new QSpinBox; row.spinUni->setRange(0, 32767); row.spinUni->setValue(i);
+        row.lblRx = new QLabel("--");
+        row.lblRx->setStyleSheet("color:#00d4ff; font-size:13px; font-weight:bold; font-family:Consolas;");
+        tbl->addWidget(idx, i + 1, 0);
+        tbl->addWidget(row.chkEnabled, i + 1, 1, Qt::AlignCenter);
+        tbl->addWidget(row.cmbPort, i + 1, 2);
+        tbl->addWidget(row.spinUni, i + 1, 3);
+        tbl->addWidget(row.lblRx, i + 1, 4);
+    }
+    tbl->setColumnStretch(5, 1);
+    cfg->addLayout(tbl);
 
     auto *rowOpt = new QHBoxLayout;
     rowOpt->setContentsMargins(0, 0, 0, 0);
@@ -3427,16 +3618,15 @@ QWidget *ArtNetRecorderMainWindow::buildPageDmxToArt() {
     rowOpt->addSpacing(24);
     rowOpt->addWidget(m_d2aFeedOut);
     rowOpt->addStretch();
-    cfg->addLayout(rowOpt, 3, 0, 1, 5);
+    cfg->addLayout(rowOpt);
 
     auto *rowBtn = new QHBoxLayout;
     rowBtn->setContentsMargins(0, 0, 0, 0);
     rowBtn->addWidget(m_btnD2aToggle);
     rowBtn->addWidget(m_lblD2aState);
     rowBtn->addStretch();
-    cfg->addLayout(rowBtn, 4, 0, 1, 5);
+    cfg->addLayout(rowBtn);
 
-    cfg->setColumnStretch(4, 1);
     root->addWidget(createCard(tr("转换参数"), cfgBody), 0);
 
     auto *statBody = new QWidget;
@@ -3471,10 +3661,18 @@ QWidget *ArtNetRecorderMainWindow::buildPageDmxToArt() {
 
     m_d2aStatTimer = new QTimer(this);
     connect(m_d2aStatTimer, &QTimer::timeout, this, [this]{
-        if (m_lblD2aRx)      m_lblD2aRx->setText(QString::number(m_d2aRxCount));
+        quint64 totalRx = 0;
+        for (int i = 0; i < kDmxToArtIns; ++i) {
+            totalRx += m_d2aIns[i].rxCount;
+            if (m_d2aIns[i].lblRx)
+                m_d2aIns[i].lblRx->setText(m_d2aIns[i].serial
+                                               ? QString::number(m_d2aIns[i].rxCount)
+                                               : QStringLiteral("--"));
+        }
+        if (m_lblD2aRx)      m_lblD2aRx->setText(QString::number(totalRx));
         if (m_lblD2aTx)      m_lblD2aTx->setText(QString::number(m_d2aTxCount));
         if (m_lblD2aDrop)    m_lblD2aDrop->setText(QString::number(m_d2aDropCount));
-        if (m_lblD2aUni)     m_lblD2aUni->setText(m_d2aRxCount ? QString::number(m_d2aLastUni) : "--");
+        if (m_lblD2aUni)     m_lblD2aUni->setText(totalRx ? QString::number(m_d2aLastUni) : "--");
         if (m_lblD2aLatency) m_lblD2aLatency->setText(m_d2aLatencyUs > 0
                                                           ? QString("%1 µs").arg(m_d2aLatencyUs)
                                                           : "--");
@@ -3486,7 +3684,7 @@ QWidget *ArtNetRecorderMainWindow::buildPageDmxToArt() {
 
     connect(btnRefresh, &QPushButton::clicked, this, [this]{ refreshD2aPorts(); });
     connect(m_btnD2aToggle, &QPushButton::clicked, this, [this]{
-        if (m_d2aSerial) stopDmxToArt();
+        if (m_d2aSocket) stopDmxToArt();
         else startDmxToArt();
     });
 
@@ -3496,14 +3694,302 @@ QWidget *ArtNetRecorderMainWindow::buildPageDmxToArt() {
     // 自动化验证: 注入一帧合成 DMX 数据, 走完整的解析/转换路径
     if (qEnvironmentVariableIntValue("ARTNET_UI_D2A_SELFTEST") == 1)
         QTimer::singleShot(1500, this, [this]{
-            if (!m_d2aSerial) return;
+            if (!m_d2aIns[0].serial) return;
             QByteArray f(1, char(0x00));
             f.append(QByteArray(512, 0));
             f[1] = char(200);
-            m_d2aAccum.append(f);
-            onD2aSerialData();
+            m_d2aIns[0].accum.append(f);
+            onD2aSerialData(0);
         });
 
+    return page;
+}
+
+// ============================================================
+// 页面: NPU → DMX512 转换测试
+//   复用生产 NpuSource 接收 MA NPU (Ma-Net2) DMX 数据包 (单播/广播, 默认 UDP 9999),
+//   按 8 路输出的域段映射 (universeRaw 0..255) 转成 DMX512 串口帧发出.
+// ============================================================
+void ArtNetRecorderMainWindow::refreshNp2dPorts() {
+    // 一次枚举, 刷新全部 8 行的串口下拉, 尽量保留各行已选项
+    QStringList keeps;
+    for (int i = 0; i < kNp2dOuts; ++i)
+        keeps << (m_np2dOuts[i].cmbPort ? m_np2dOuts[i].cmbPort->currentData().toString()
+                                        : QString());
+    const auto ports = QSerialPortInfo::availablePorts();
+    for (int i = 0; i < kNp2dOuts; ++i) {
+        QComboBox *cmb = m_np2dOuts[i].cmbPort;
+        if (!cmb) continue;
+        cmb->clear();
+        for (const QSerialPortInfo &pi : ports) {
+            cmb->addItem(pi.portName() + (pi.description().isEmpty()
+                                              ? QString()
+                                              : "  (" + pi.description() + ")"),
+                         pi.portName());
+        }
+        if (cmb->count() == 0)
+            cmb->addItem(tr("(无可用串口)"), QString());
+        const int idx = cmb->findData(keeps.at(i));
+        if (idx >= 0) cmb->setCurrentIndex(idx);
+    }
+}
+
+void ArtNetRecorderMainWindow::startNpuToDmx() {
+    stopNpuToDmx();
+    if (!m_np2dListenPort) return;
+
+    // 对每个"启用且选了串口"的行创建一个 Dmx512Sender 并 open;
+    // 单行失败只记日志, 不影响其余行
+    int opened = 0;
+    QStringList openedDesc;
+    for (int i = 0; i < kNp2dOuts; ++i) {
+        Np2dOutput &row = m_np2dOuts[i];
+        if (!row.chkEnabled || !row.chkEnabled->isChecked()) continue;
+        const QString portName = row.cmbPort ? row.cmbPort->currentData().toString() : QString();
+        if (portName.isEmpty()) {
+            appendLog(tr("NPU→DMX: 输出 %1 已启用但未选择串口").arg(i + 1), "warn");
+            continue;
+        }
+        auto *sender = new Dmx512Sender(this);
+        if (!sender->open(portName)) {
+            appendLog(tr("NPU→DMX: 打开串口 %1 失败 (输出 %2)").arg(portName).arg(i + 1),
+                      "error");
+            delete sender;
+            continue;
+        }
+        row.sender = sender;
+        ++opened;
+        openedDesc << tr("输出%1 %2 域%3起×%4")
+                      .arg(i + 1).arg(portName)
+                      .arg(row.spinStart->value()).arg(row.spinSpan->value());
+    }
+    if (opened == 0) {
+        appendLog(tr("NPU→DMX: 没有成功打开的 DMX 输出串口, 请检查启用行与端口选择"), "error");
+        return;
+    }
+
+    // 复用生产 NpuSource: 自管 socket + 包解析, 经 frameReceived 送出 LightFrame
+    const QString bindIp = m_np2dListenIp && !m_np2dListenIp->text().trimmed().isEmpty()
+                               ? m_np2dListenIp->text().trimmed() : QStringLiteral("0.0.0.0");
+    m_np2dSource = new NpuSource(this);
+    connect(m_np2dSource, &NpuSource::frameReceived,
+            this, [this](const LightFrame &f){ onNp2dFrame(f); });
+    ConnectionParams params;
+    params.protocol = ProtocolType::Npu;
+    params.localBindAddress = bindIp;
+    params.localPort = quint16(m_np2dListenPort->value());
+    if (!m_np2dSource->start(params)) {
+        appendLog(tr("NPU→DMX: 绑定 NPU 监听 %1:%2 失败").arg(bindIp).arg(params.localPort),
+                  "error");
+        m_np2dSource->deleteLater(); m_np2dSource = nullptr;
+        stopNpuToDmx();
+        return;
+    }
+
+    m_np2dRxCount = m_np2dDropCount = 0;
+    m_np2dLastUni = 0;
+    m_np2dLastDmx.clear();
+
+    m_btnNp2dToggle->setText(tr("■ 停止转换"));
+    m_lblNp2dState->setText(tr("<span style='color:#00e676'>转换中</span> "
+                               "<span style='color:#8fb3d9'>NPU %1:%2 → %3 路串口输出</span>")
+                                .arg(bindIp).arg(params.localPort).arg(opened));
+    appendLog(tr("NPU→DMX: 已开始 %1:%2 → %3 路串口 (250000 8N2): %4")
+                  .arg(bindIp).arg(params.localPort).arg(opened).arg(openedDesc.join(", ")),
+              "info");
+}
+
+void ArtNetRecorderMainWindow::stopNpuToDmx() {
+    if (m_np2dSource) {
+        m_np2dSource->stop();
+        m_np2dSource->deleteLater();
+        m_np2dSource = nullptr;
+    }
+    for (int i = 0; i < kNp2dOuts; ++i) {
+        if (m_np2dOuts[i].sender) {
+            m_np2dOuts[i].sender->close();
+            m_np2dOuts[i].sender->deleteLater();
+            m_np2dOuts[i].sender = nullptr;
+        }
+    }
+    if (m_btnNp2dToggle) m_btnNp2dToggle->setText(tr("▶ 开始转换"));
+    if (m_lblNp2dState)
+        m_lblNp2dState->setText(tr("<span style='color:#8fb3d9'>未启动</span>"));
+}
+
+void ArtNetRecorderMainWindow::onNp2dFrame(const LightFrame &frame) {
+    m_np2dRxCount++;
+    const int uni = frame.universeRaw;   // NPU 原始域编号 0..255
+    m_np2dLastUni = quint16(uni);
+    m_np2dLastDmx = frame.dmxData;
+    if (m_np2dLastDmx.size() < 512)
+        m_np2dLastDmx.append(QByteArray(512 - m_np2dLastDmx.size(), 0));
+
+    // 路由: 第一个 启用 && sender 已打开 && universe ∈ [起始, 起始+覆盖数) 的行
+    Dmx512Sender *target = nullptr;
+    for (int i = 0; i < kNp2dOuts; ++i) {
+        Np2dOutput &row = m_np2dOuts[i];
+        if (!row.chkEnabled || !row.chkEnabled->isChecked()
+            || !row.sender || !row.sender->isOpen()) continue;
+        const int start = row.spinStart ? row.spinStart->value() : 0;
+        const int span  = row.spinSpan  ? row.spinSpan->value()  : 1;
+        if (uni >= start && uni < start + span) { target = row.sender; break; }
+    }
+    if (!target) { ++m_np2dDropCount; return; }
+
+    target->sendFrame(m_np2dLastDmx);
+    if (m_np2dFeedOut && m_np2dFeedOut->isChecked())
+        feedLiveUniverse(false, quint16(uni), m_np2dLastDmx,
+                         QDateTime::currentMSecsSinceEpoch() * 1000);
+}
+
+QWidget *ArtNetRecorderMainWindow::buildPageNpuToDmx() {
+    auto *page = new QWidget();
+    auto *root = new QVBoxLayout(page);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(10);
+
+    auto *hint = new QLabel(tr("NPU → DMX512 转换测试 — 监听 MA NPU (Ma-Net2) DMX 数据包 (单播/广播, 默认 UDP 9999), "
+                               "支持最多 8 路 DMX 串口输出; 每行按「起始 Universe (0..255) + 覆盖域数」划分域段, "
+                               "收到帧后路由到第一个匹配段所属串口 (同一帧只发一路, 不匹配任何启用段的帧计入丢弃). "
+                               "BREAK/MAB 由发送器按 250000 8N2 标准自动处理."));
+    hint->setWordWrap(true);
+    hint->setStyleSheet("color:#8fb3d9; font-size:12px;");
+    root->addWidget(hint);
+
+    auto *cfgBody = new QWidget;
+    auto *cfg = new QVBoxLayout(cfgBody);
+    cfg->setContentsMargins(0, 0, 0, 0);
+    cfg->setSpacing(8);
+
+    // ---- 顶部: 监听 IP / 端口 / 输出选项 / 刷新 ----
+    auto *rowTop = new QHBoxLayout;
+    rowTop->setContentsMargins(0, 0, 0, 0);
+    m_np2dListenIp = new QLineEdit("0.0.0.0"); m_np2dListenIp->setMinimumWidth(120);
+    m_np2dListenPort = new QSpinBox; m_np2dListenPort->setRange(1, 65535);
+    m_np2dListenPort->setValue(NpuProtocol::DEFAULT_PORT);
+    m_np2dFeedOut   = new QCheckBox(tr("转换结果 → 实时输出页"));
+    m_np2dFeedOut->setChecked(true);
+    auto *btnRefresh = new QPushButton(tr("刷新端口"));
+    btnRefresh->setProperty("action", "tool");
+    rowTop->addWidget(new QLabel(tr("监听 IP:")));
+    rowTop->addWidget(m_np2dListenIp);
+    rowTop->addWidget(new QLabel(tr("监听 UDP 端口:")));
+    rowTop->addWidget(m_np2dListenPort);
+    rowTop->addSpacing(18);
+    rowTop->addWidget(m_np2dFeedOut);
+    rowTop->addStretch();
+    rowTop->addWidget(btnRefresh);
+    cfg->addLayout(rowTop);
+
+    // ---- 输出配置表: 8 行 (启用 / 串口 / 起始 Universe / 覆盖域数 / 已发帧数) ----
+    auto *tbl = new QGridLayout;
+    tbl->setContentsMargins(0, 0, 0, 0);
+    tbl->setHorizontalSpacing(10);
+    tbl->setVerticalSpacing(6);
+
+    auto makeHead = [](const QString &t) {
+        auto *l = new QLabel(t);
+        l->setStyleSheet("color:#8fb3d9; font-size:12px;");
+        return l;
+    };
+    tbl->addWidget(makeHead(tr("#")),              0, 0);
+    tbl->addWidget(makeHead(tr("启用")),           0, 1);
+    tbl->addWidget(makeHead(tr("DMX 输出串口")),   0, 2);
+    tbl->addWidget(makeHead(tr("起始 Universe")),  0, 3);
+    tbl->addWidget(makeHead(tr("覆盖域数")),       0, 4);
+    tbl->addWidget(makeHead(tr("已发帧数")),       0, 5);
+
+    for (int i = 0; i < kNp2dOuts; ++i) {
+        Np2dOutput &row = m_np2dOuts[i];
+        auto *idx = makeHead(QString::number(i + 1));
+        idx->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        row.chkEnabled = new QCheckBox;
+        row.chkEnabled->setChecked(i == 0);   // 第 1 行默认启用
+        row.cmbPort = new QComboBox; row.cmbPort->setMinimumWidth(170);
+        row.spinStart = new QSpinBox; row.spinStart->setRange(0, 255); row.spinStart->setValue(i);
+        row.spinSpan  = new QSpinBox; row.spinSpan->setRange(1, 8);    row.spinSpan->setValue(1);
+        row.lblSent = new QLabel("--");
+        row.lblSent->setStyleSheet("color:#00d4ff; font-size:13px; font-weight:bold; font-family:Consolas;");
+        tbl->addWidget(idx, i + 1, 0);
+        tbl->addWidget(row.chkEnabled, i + 1, 1, Qt::AlignCenter);
+        tbl->addWidget(row.cmbPort, i + 1, 2);
+        tbl->addWidget(row.spinStart, i + 1, 3);
+        tbl->addWidget(row.spinSpan, i + 1, 4);
+        tbl->addWidget(row.lblSent, i + 1, 5);
+    }
+    tbl->setColumnStretch(6, 1);
+    cfg->addLayout(tbl);
+
+    m_btnNp2dToggle = new QPushButton(tr("▶ 开始转换"));
+    m_btnNp2dToggle->setProperty("action", "start");
+    m_lblNp2dState = new QLabel(tr("<span style='color:#8fb3d9'>未启动</span>"));
+    auto *rowBtn = new QHBoxLayout;
+    rowBtn->setContentsMargins(0, 0, 0, 0);
+    rowBtn->addWidget(m_btnNp2dToggle);
+    rowBtn->addWidget(m_lblNp2dState);
+    rowBtn->addStretch();
+    cfg->addLayout(rowBtn);
+
+    root->addWidget(createCard(tr("转换参数"), cfgBody), 0);
+
+    // ---- 转换结果 ----
+    auto *statBody = new QWidget;
+    auto *st = new QGridLayout(statBody);
+    st->setContentsMargins(0, 0, 0, 0);
+    st->setHorizontalSpacing(18);
+    st->setVerticalSpacing(10);
+
+    auto makeStat = [](const QString &title, QLabel **out, QGridLayout *lay, int row, int col) {
+        auto *cap = new QLabel(title);
+        cap->setStyleSheet("color:#8fb3d9; font-size:12px;");
+        auto *val = new QLabel("--");
+        val->setStyleSheet("color:#00d4ff; font-size:18px; font-weight:bold; font-family:Consolas;");
+        auto *box = new QVBoxLayout;
+        box->setContentsMargins(0, 0, 0, 0);
+        box->setSpacing(2);
+        box->addWidget(cap);
+        box->addWidget(val);
+        lay->addLayout(box, row, col);
+        *out = val;
+    };
+
+    makeStat(tr("接收 NPU 帧"),  &m_lblNp2dRxFrames, st, 0, 0);
+    makeStat(tr("发送 DMX 帧"),  &m_lblNp2dTxFrames, st, 0, 1);
+    makeStat(tr("丢弃帧"),       &m_lblNp2dDropped,  st, 0, 2);
+    makeStat(tr("最近域"),       &m_lblNp2dLastUni,  st, 1, 0);
+    makeStat(tr("CH1"),          &m_lblNp2dCh1,      st, 1, 1);
+
+    root->addWidget(createCard(tr("转换结果"), statBody), 0);
+    root->addStretch();
+
+    m_np2dStatTimer = new QTimer(this);
+    connect(m_np2dStatTimer, &QTimer::timeout, this, [this]{
+        quint64 totalTx = 0;
+        for (int i = 0; i < kNp2dOuts; ++i) {
+            const quint64 sent = m_np2dOuts[i].sender ? m_np2dOuts[i].sender->totalSentFrames() : 0;
+            totalTx += sent;
+            if (m_np2dOuts[i].lblSent)
+                m_np2dOuts[i].lblSent->setText(m_np2dOuts[i].sender ? QString::number(sent)
+                                                                    : QStringLiteral("--"));
+        }
+        if (m_lblNp2dRxFrames) m_lblNp2dRxFrames->setText(QString::number(m_np2dRxCount));
+        if (m_lblNp2dTxFrames) m_lblNp2dTxFrames->setText(QString::number(totalTx));
+        if (m_lblNp2dDropped)  m_lblNp2dDropped->setText(QString::number(m_np2dDropCount));
+        if (m_lblNp2dLastUni)  m_lblNp2dLastUni->setText(m_np2dRxCount ? QString::number(m_np2dLastUni) : "--");
+        if (m_lblNp2dCh1)      m_lblNp2dCh1->setText(m_np2dLastDmx.size() >= 1
+                                                        ? QString::number(uchar(m_np2dLastDmx.at(0)))
+                                                        : "--");
+    });
+    m_np2dStatTimer->start(300);
+
+    connect(btnRefresh, &QPushButton::clicked, this, [this]{ refreshNp2dPorts(); });
+    connect(m_btnNp2dToggle, &QPushButton::clicked, this, [this]{
+        if (m_np2dSource) stopNpuToDmx();
+        else startNpuToDmx();
+    });
+
+    refreshNp2dPorts();
     return page;
 }
 
@@ -5673,7 +6159,8 @@ void ArtNetRecorderMainWindow::updateNavIndicators() {
     const bool sacnRun   = m_sacnTest && (m_sacnTest->txSocket || m_sacnTest->rxTestMode);
     const bool dmxRun    = (m_dmxTxSerial != nullptr) || m_dmxRxTestMode;
     const bool brRun     = (m_brSocket != nullptr);
-    const bool d2aRun    = (m_d2aSerial != nullptr);
+    const bool d2aRun    = (m_d2aSocket != nullptr);
+    const bool np2dRun   = (m_np2dSource != nullptr);
     const bool rdmRun    = m_rdmListening;
 
     const QColor runColor("#00e676");
@@ -5684,6 +6171,7 @@ void ArtNetRecorderMainWindow::updateNavIndicators() {
     setMark(10, dmxRun    ? QStringLiteral("● 测试中") : QString(), runColor);
     setMark(11, brRun     ? QStringLiteral("● 转换中") : QString(), QColor("#ffb300"));
     setMark(12, d2aRun    ? QStringLiteral("● 转换中") : QString(), QColor("#ffb300"));
+    setMark(13, np2dRun   ? QStringLiteral("● 转换中") : QString(), QColor("#ffb300"));
 
     const bool inActive  = m_liveInActiveUs  > 0 && (nowUs - m_liveInActiveUs)  < 2000000;
     const bool outActive = m_liveOutActiveUs > 0 && (nowUs - m_liveOutActiveUs) < 2000000;

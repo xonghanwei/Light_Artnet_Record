@@ -50,6 +50,8 @@ class MediaPlayerPanel;
 
 class QSerialPort;
 class QUdpSocket;
+class Dmx512Sender;
+class NpuSource;
 
 // 协议输入/输出页面共享的 tab 数据结构
 struct ProtocolInputTab {
@@ -135,6 +137,7 @@ struct NetTestPage {
     QSpinBox    *spinTargetPort= nullptr;
     QSpinBox    *spinListenPort= nullptr;   // 接收测试绑定的本地端口 (回环时可与目标端口不同)
     QSpinBox    *spinUniverse  = nullptr;
+    QSpinBox    *spinUniverseCount = nullptr;  // 连续发送域数量 1..8 (自起始域)
     QSpinBox    *spinPriority  = nullptr;   // sACN 优先级
     QSpinBox    *spinFrameRate = nullptr;
     QComboBox   *cmbMode       = nullptr;   // 恒值 / 单通道扫描 / 逐通道走灯
@@ -406,72 +409,122 @@ private:
     int          m_dmxRamp       = 0;
     bool         m_dmxRampUp     = true;
 
-    // ===== 页面: Art-Net → DMX512 转换测试 =====
+    // ===== 页面: Art-Net → DMX512 转换测试 (最多 8 路串口输出) =====
     QWidget *buildPageArtToDmx();
     void refreshArtToDmxPorts();
     void startArtToDmx();
     void stopArtToDmx();
     void onArtToDmxDatagram();
-    void writeArtToDmxFrame(const QByteArray &dmx);
 
+    enum { kArtToDmxOuts = 8 };
+    // 每路输出: 启用 + 串口 + 起始 Universe + 覆盖域数, 运行期各自持有 Dmx512Sender
+    struct ArtToDmxOutput {
+        QCheckBox    *chkEnabled = nullptr;
+        QComboBox    *cmbPort    = nullptr;
+        QSpinBox     *spinStart  = nullptr;
+        QSpinBox     *spinSpan   = nullptr;
+        QLabel       *lblSent    = nullptr;
+        Dmx512Sender *sender     = nullptr;   // 未启动时为 nullptr
+    };
+
+    QLineEdit   *m_brListenIp   = nullptr;   // 绑定接收 Art-Net 包的本地 IP
     QSpinBox    *m_brListenPort  = nullptr;
-    QSpinBox    *m_brUniverse    = nullptr;
-    QComboBox   *m_brSerialPort  = nullptr;
-    QComboBox   *m_brBreakMode   = nullptr;
-    QCheckBox   *m_brFilterUni   = nullptr;   // 只转发匹配域的包
     QCheckBox   *m_brFeedOut     = nullptr;   // 转换结果写入实时输出页
     QPushButton *m_btnBrToggle   = nullptr;
     QLabel      *m_lblBrState    = nullptr;
     QLabel      *m_lblBrRxFrames = nullptr;
-    QLabel      *m_lblBrTxFrames = nullptr;
+    QLabel      *m_lblBrTxFrames = nullptr;   // 全部输出行发送帧合计
     QLabel      *m_lblBrDropped  = nullptr;
     QLabel      *m_lblBrLastUni  = nullptr;
     QLabel      *m_lblBrLatency  = nullptr;
     QLabel      *m_lblBrCh1      = nullptr;
     QUdpSocket  *m_brSocket      = nullptr;
-    QSerialPort *m_brSerial      = nullptr;
     QTimer      *m_brStatTimer   = nullptr;
+    ArtToDmxOutput m_brOuts[kArtToDmxOuts];
     quint64      m_brRxCount     = 0;
-    quint64      m_brTxCount     = 0;
     quint64      m_brDropCount   = 0;
     qint64       m_brLastLatencyUs = 0;
     quint16      m_brLastUni     = 0;
     QByteArray   m_brLastDmx;
 
-    // ===== 页面: DMX512 → Art-Net 转换测试 =====
+    // ===== 页面: DMX512 → Art-Net 转换测试 (最多 8 路串口输入) =====
     QWidget *buildPageDmxToArt();
     void refreshD2aPorts();
     void startDmxToArt();
     void stopDmxToArt();
-    void onD2aSerialData();
-    void convertDmxToArt(const QByteArray &dmx);
+    void onD2aSerialData(int row);
+    void convertDmxToArt(int row, const QByteArray &dmx);
 
-    QComboBox   *m_d2aSerialPort = nullptr;
+    enum { kDmxToArtIns = 8 };
+    // 每路输入: 启用 + 串口 + 目标 Universe, 独立接收累积缓冲 / 帧计数 / ArtDmx 序号
+    struct DmxToArtInput {
+        QCheckBox   *chkEnabled = nullptr;
+        QComboBox   *cmbPort    = nullptr;
+        QSpinBox    *spinUni    = nullptr;
+        QLabel      *lblRx      = nullptr;
+        QSerialPort *serial     = nullptr;   // 未启动时为 nullptr
+        QByteArray   accum;
+        quint64      rxCount    = 0;
+        quint8       seq        = 0;
+    };
+
     QComboBox   *m_d2aFormat     = nullptr;   // 512 / 513 / 514
     QLineEdit   *m_d2aTargetIp   = nullptr;
     QSpinBox    *m_d2aTargetPort = nullptr;
-    QSpinBox    *m_d2aUniverse   = nullptr;
     QCheckBox   *m_d2aFeedIn     = nullptr;
     QCheckBox   *m_d2aFeedOut    = nullptr;
     QPushButton *m_btnD2aToggle  = nullptr;
     QLabel      *m_lblD2aState   = nullptr;
-    QLabel      *m_lblD2aRx      = nullptr;
+    QLabel      *m_lblD2aRx      = nullptr;   // 全部输入行收到帧合计
     QLabel      *m_lblD2aTx      = nullptr;
     QLabel      *m_lblD2aDrop    = nullptr;
     QLabel      *m_lblD2aUni     = nullptr;
     QLabel      *m_lblD2aLatency = nullptr;
     QLabel      *m_lblD2aCh1     = nullptr;
-    QSerialPort *m_d2aSerial     = nullptr;
     QUdpSocket  *m_d2aSocket     = nullptr;
     QTimer      *m_d2aStatTimer  = nullptr;
-    QByteArray   m_d2aAccum;
+    DmxToArtInput m_d2aIns[kDmxToArtIns];
     QByteArray   m_d2aLastDmx;
-    quint64      m_d2aRxCount    = 0;
     quint64      m_d2aTxCount    = 0;
     quint64      m_d2aDropCount  = 0;
     qint64       m_d2aLatencyUs  = 0;
     quint16      m_d2aLastUni    = 0;
-    quint8       m_d2aSeq        = 0;
+
+    // ===== 页面: NPU → DMX512 转换测试 (最多 8 路串口输出) =====
+    QWidget *buildPageNpuToDmx();
+    void refreshNp2dPorts();
+    void startNpuToDmx();
+    void stopNpuToDmx();
+    void onNp2dFrame(const LightFrame &frame);
+
+    enum { kNp2dOuts = 8 };
+    // 每路输出: 启用 + 串口 + 起始 Universe(0..255) + 覆盖域数, 运行期各自持有 Dmx512Sender
+    struct Np2dOutput {
+        QCheckBox    *chkEnabled = nullptr;
+        QComboBox    *cmbPort    = nullptr;
+        QSpinBox     *spinStart  = nullptr;
+        QSpinBox     *spinSpan   = nullptr;
+        QLabel       *lblSent    = nullptr;
+        Dmx512Sender *sender     = nullptr;   // 未启动时为 nullptr
+    };
+
+    QLineEdit   *m_np2dListenIp   = nullptr;
+    QSpinBox    *m_np2dListenPort = nullptr;
+    QCheckBox   *m_np2dFeedOut    = nullptr;   // 转换结果写入实时输出页
+    QPushButton *m_btnNp2dToggle  = nullptr;
+    QLabel      *m_lblNp2dState   = nullptr;
+    QLabel      *m_lblNp2dRxFrames= nullptr;
+    QLabel      *m_lblNp2dTxFrames= nullptr;   // 全部输出行发送帧合计
+    QLabel      *m_lblNp2dDropped = nullptr;
+    QLabel      *m_lblNp2dLastUni = nullptr;
+    QLabel      *m_lblNp2dCh1     = nullptr;
+    NpuSource   *m_np2dSource     = nullptr;   // 复用生产 NPU 接收路径
+    QTimer      *m_np2dStatTimer  = nullptr;
+    Np2dOutput   m_np2dOuts[kNp2dOuts];
+    quint64      m_np2dRxCount    = 0;
+    quint64      m_np2dDropCount  = 0;
+    quint16      m_np2dLastUni    = 0;
+    QByteArray   m_np2dLastDmx;
 
     // ===== 页面 3: 输入数据 (QTabWidget: ArtNet / DMX512 / NPU / RDM / ArtRecFile) =====
     QWidget *buildPageInputData();
