@@ -22,6 +22,7 @@
 #include "output/Dmx512Sender.h"
 #include "protocol/sources/NpuSource.h"
 #include <cstring>
+#include <algorithm>
 
 #ifdef Q_OS_WIN
 #  ifndef NOMINMAX
@@ -710,6 +711,15 @@ ArtNetRecorderMainWindow::ArtNetRecorderMainWindow(QWidget *parent)
     m_uiTimer->setInterval(250);
     connect(m_uiTimer, &QTimer::timeout, this, &ArtNetRecorderMainWindow::tickUpdate);
     m_uiTimer->start();
+
+    // 分组时间片调度器: 流组 5ms 精确片 (周期发送), 统计组 300ms (仅当前可见页)
+    m_schedStreamTimer = new QTimer(this);
+    m_schedStreamTimer->setTimerType(Qt::PreciseTimer);
+    connect(m_schedStreamTimer, &QTimer::timeout, this, &ArtNetRecorderMainWindow::onSchedStreamTick);
+    m_schedStreamTimer->start(5);
+    m_schedStatTimer = new QTimer(this);
+    connect(m_schedStatTimer, &QTimer::timeout, this, &ArtNetRecorderMainWindow::onSchedStatTick);
+    m_schedStatTimer->start(300);
 }
 
 ArtNetRecorderMainWindow::~ArtNetRecorderMainWindow() {
@@ -813,6 +823,10 @@ void ArtNetRecorderMainWindow::setupContent() {
     m_stack->addWidget(wrapScroll(buildPageOutput()));      // 转发输出 (老页面, 保留)
     m_stack->addWidget(wrapScroll(buildPageFileMgr()));
     m_stack->addWidget(wrapScroll(buildPageSystem()));
+
+    // 切页暂停/恢复: 离开页的流任务置 Paused, 回页恢复 (须在导航定位前接好)
+    connect(m_stack, &QStackedWidget::currentChanged,
+            this, &ArtNetRecorderMainWindow::onSchedPageChanged);
 
     // === 导航项 ===
     QList<QPair<QString, int>> navItems = {
@@ -937,6 +951,120 @@ void ArtNetRecorderMainWindow::loadUiConfig() {
 
 void ArtNetRecorderMainWindow::onNavChanged(int row) {
     if (row >= 0 && row < m_stack->count()) m_stack->setCurrentIndex(row);
+}
+
+// ============================================================
+// 分组时间片任务调度器 — 收敛各测试页的周期 QTimer
+//   流组: 5ms 精确时间片轮询, 仅 Running 且所属页可见的任务累计 accMs,
+//         到期触发 onTick 并在同一处判定 deadlineMs (原子结束判定)
+//   统计组: 300ms 轮询注册的低频统计回调, 只执行当前可见页的
+// ============================================================
+
+// 沿父链找到 m_stack 的直接子页并返回其索引; 页面尚未入栈返回 -1
+static int stackIndexOfWidget(QStackedWidget *stack, QWidget *w) {
+    for (QWidget *p = w; p; p = p->parentWidget())
+        if (p->parentWidget() == stack) return stack->indexOf(p);
+    return -1;
+}
+
+int ArtNetRecorderMainWindow::addStreamTask(QWidget *page, std::function<void()> onTick,
+                                            qint64 deadlineMs, std::function<void()> onFinished) {
+    StreamTask t;
+    t.page       = page;
+    t.pageId     = page ? kPagePending : kPageAlways;   // 构建期未入栈, 首次 tick 解析
+    t.deadlineMs = deadlineMs;
+    t.onTick     = std::move(onTick);
+    t.onFinished = std::move(onFinished);
+    m_streamTasks.append(t);
+    return m_streamTasks.size() - 1;
+}
+
+int ArtNetRecorderMainWindow::addStatTask(QWidget *page, std::function<void()> onTick) {
+    StatTask t;
+    t.page   = page;
+    t.pageId = page ? kPagePending : kPageAlways;
+    t.onTick = std::move(onTick);
+    m_statTasks.append(t);
+    return m_statTasks.size() - 1;
+}
+
+void ArtNetRecorderMainWindow::startStreamTask(int id, int periodMs) {
+    if (id < 0 || id >= m_streamTasks.size()) return;
+    StreamTask &t = m_streamTasks[id];
+    t.periodMs = qMax(1, periodMs);
+    t.accMs    = 0;
+    t.runMs    = 0;
+    t.state    = StreamTask::Running;
+}
+
+void ArtNetRecorderMainWindow::stopStreamTask(int id) {
+    if (id < 0 || id >= m_streamTasks.size()) return;
+    m_streamTasks[id].state = StreamTask::Idle;
+}
+
+void ArtNetRecorderMainWindow::removeTasksOfPage(QWidget *page) {
+    // 页销毁时统一调用; erase 会使其余任务 id 失效, 本窗口页面常驻不触发
+    m_streamTasks.erase(std::remove_if(m_streamTasks.begin(), m_streamTasks.end(),
+                          [page](const StreamTask &t){ return t.page == page; }),
+                        m_streamTasks.end());
+    m_statTasks.erase(std::remove_if(m_statTasks.begin(), m_statTasks.end(),
+                          [page](const StatTask &t){ return t.page == page; }),
+                      m_statTasks.end());
+}
+
+void ArtNetRecorderMainWindow::onSchedStreamTick() {
+    if (!m_stack) return;
+    const int cur = m_stack->currentIndex();
+    for (StreamTask &t : m_streamTasks) {
+        if (t.state != StreamTask::Running) continue;
+        if (t.pageId == kPagePending) {
+            const int idx = stackIndexOfWidget(m_stack, t.page);
+            if (idx < 0) continue;                    // 页面未入栈, 下个时间片再试
+            t.pageId = idx;
+        }
+        if (t.pageId != kPageAlways && t.pageId != cur) continue;   // 非当前页不累计
+        t.accMs += 5;
+        t.runMs += 5;
+        if (t.accMs < t.periodMs) continue;
+        t.accMs -= t.periodMs;
+        if (t.onTick) t.onTick();
+        // 原子结束判定: tick 执行完在同一处判断累计时长
+        if (t.deadlineMs > 0 && t.runMs >= t.deadlineMs) {
+            t.state = StreamTask::Finished;
+            if (t.onFinished) t.onFinished();
+        }
+    }
+}
+
+void ArtNetRecorderMainWindow::onSchedStatTick() {
+    if (!m_stack) return;
+    const int cur = m_stack->currentIndex();
+    for (StatTask &t : m_statTasks) {
+        if (t.pageId == kPagePending) {
+            const int idx = stackIndexOfWidget(m_stack, t.page);
+            if (idx < 0) continue;
+            t.pageId = idx;
+        }
+        if (t.pageId != kPageAlways && t.pageId != cur) continue;   // 只刷新当前可见页
+        if (t.onTick) t.onTick();
+    }
+}
+
+void ArtNetRecorderMainWindow::onSchedPageChanged(int cur) {
+    const int prev = m_schedCurPage;
+    m_schedCurPage = cur;
+    for (StreamTask &t : m_streamTasks) {
+        if (t.pageId == kPagePending) {
+            const int idx = stackIndexOfWidget(m_stack, t.page);
+            if (idx >= 0) t.pageId = idx;
+        }
+        if (t.pageId == prev && t.state == StreamTask::Running) {
+            t.state = StreamTask::Paused;
+        } else if (t.pageId == cur && t.state == StreamTask::Paused) {
+            t.state = StreamTask::Running;
+            t.accMs = 0;                              // 清零防补发爆发
+        }
+    }
 }
 
 // ============================================================
@@ -1880,7 +2008,7 @@ void ArtNetRecorderMainWindow::startDmxTestTx() {
         rxInfo += tr("<span style='color:#00d4ff'> · 模拟回显</span>");
     }
 
-    m_dmxTxTimer->start(qMax(1, 1000 / qMax(1, m_dmxFrameRate->value())));
+    startStreamTask(m_dmxTxTaskId, qMax(1, 1000 / qMax(1, m_dmxFrameRate->value())));
     if (m_dmxLoopbackSim && m_dmxLoopbackSim->isChecked()) {
         appendLog(m_dmxRxSerial
                       ? tr("DMX512 测试: 已使用物理环回, 软件环回模拟不生效")
@@ -1899,7 +2027,7 @@ void ArtNetRecorderMainWindow::startDmxTestTx() {
 }
 
 void ArtNetRecorderMainWindow::stopDmxTestTx() {
-    if (m_dmxTxTimer) m_dmxTxTimer->stop();
+    stopStreamTask(m_dmxTxTaskId);
     if (m_dmxTxSerial) {
         m_dmxTxSerial->setBreakEnabled(false);
         m_dmxTxSerial->close();
@@ -2255,7 +2383,7 @@ void ArtNetRecorderMainWindow::startNetTestTx(NetTestPage *p) {
         p->cid = makeTestCid();
     p->btnTx->setText(tr("■ 停止发送"));
     updateNetTestState(p);
-    p->txTimer->start(qMax(1, 1000 / qMax(1, p->spinFrameRate->value())));
+    startStreamTask(p->txTaskId, qMax(1, 1000 / qMax(1, p->spinFrameRate->value())));
     appendLog(tr("%1 测试: 开始在 %2:%3 发送 (%4 fps, Universe %5)")
                   .arg(name, target.toString()).arg(p->spinTargetPort->value())
                   .arg(p->spinFrameRate->value()).arg(p->spinUniverse->value()), "info");
@@ -2263,7 +2391,7 @@ void ArtNetRecorderMainWindow::startNetTestTx(NetTestPage *p) {
 
 void ArtNetRecorderMainWindow::stopNetTestTx(NetTestPage *p) {
     if (!p) return;
-    if (p->txTimer) p->txTimer->stop();
+    stopStreamTask(p->txTaskId);
     if (p->txSocket) {
         p->txSocket->close();
         p->txSocket->deleteLater();
@@ -2682,14 +2810,9 @@ QWidget *ArtNetRecorderMainWindow::buildPageNetTest(ProtocolType type) {
     root->addWidget(createCard(tr("测试结果 (接收 / 时序)"), statBody), 0);
     root->addStretch();
 
-    // ---- 定时器与信号 ----
-    p->txTimer = new QTimer(this);
-    p->txTimer->setTimerType(Qt::PreciseTimer);   // 保证 25ms/40fps 等周期不被系统粗定时器拉长
-    connect(p->txTimer, &QTimer::timeout, this, [this, p]{ writeNetTestFrame(p); });
-
-    p->statTimer = new QTimer(this);
-    connect(p->statTimer, &QTimer::timeout, this, [this, p]{ updateNetTestStats(p); });
-    p->statTimer->start(300);
+    // ---- 定时任务与信号 (周期发送/统计刷新统一交给分组时间片调度器) ----
+    p->txTaskId   = addStreamTask(page, [this, p]{ writeNetTestFrame(p); });
+    p->statTaskId = addStatTask(page,   [this, p]{ updateNetTestStats(p); });
 
     connect(p->btnTx, &QPushButton::clicked, this, [this, p]{
         if (p->txSocket) stopNetTestTx(p);
@@ -2737,38 +2860,20 @@ QWidget *ArtNetRecorderMainWindow::buildPageNetTest(ProtocolType type) {
 // ============================================================
 static const uchar kRdmTestUid[6] = {0x4C, 0x41, 0x52, 0x4E, 0x00, 0x01}; // "LARN"+0001
 
-static QByteArray buildRdmRequestPayload(bool discovery) {
-    const int params = discovery ? 12 : 0;          // DISC 参数: lower/upper UID
-    QByteArray rdm(26 + params, 0);
-    rdm[0] = char(0xCC);                            // RDM start code
-    rdm[1] = char(0x01);                            // Sub start code
-    const quint16 msgLen = quint16(22 + params);    // 长度字段后的字节数
-    rdm[2] = char(msgLen & 0xFF);
-    rdm[3] = char(msgLen >> 8);
+// RDM 参数 ID (ANSI E1.20 设备 ID 段)
+enum RdmPid : quint16 {
+    kPidDiscUniqueBranch = 0x0001,   // 发现: 唯一分支
+    kPidDeviceInfo       = 0x0060,   // 设备信息 (协议版本/子设备数/端口/footprint)
+    kPidDmx512Address    = 0x0120,   // DMX512 起始地址 (GET/SET)
+    kPidStatusMessages   = 0x0131,   // 当前故障/状态消息列表
+};
 
-    for (int i = 0; i < 6; ++i)                     // Dest UID = 广播 (全 0)
-        rdm[4 + i] = 0;
-    for (int i = 0; i < 6; ++i)                     // Source UID
-        rdm[10 + i] = char(kRdmTestUid[i]);
-
-    rdm[16] = 0;                                    // Transaction
-    rdm[17] = 0;                                    // Port ID
-    rdm[18] = 0;                                    // Message count
-    rdm[19] = 0; rdm[20] = 0;                       // Sub device
-
-    if (discovery) {
-        rdm[21] = char(0x10);                       // Command class: DISCOVERY
-        rdm[22] = 0; rdm[23] = 0;                   // PID: DISC_UNIQUE_BRANCH
-        rdm[24] = 12; rdm[25] = 0;                  // PDL = 12
-        for (int i = 0; i < 6; ++i) rdm[26 + i] = 0;              // lower UID
-        for (int i = 0; i < 6; ++i) rdm[32 + i] = char(0xFF);     // upper UID
-    } else {
-        rdm[21] = char(0x20);                       // Command class: GET
-        rdm[22] = 0x60; rdm[23] = 0;                // PID: DEVICE_INFO (0x0060)
-        rdm[24] = 0; rdm[25] = 0;                   // PDL = 0
-    }
-    return rdm;
-}
+// RDM Command Class
+enum RdmCc : quint8 {
+    kCcDiscovery = 0x10, kCcGet = 0x20, kCcSet = 0x30,
+    kCcGetAck    = 0x21, kCcGetNak = 0x22,
+    kCcSetAck    = 0x31, kCcSetNak = 0x32, kCcDiscResponse = 0x11,
+};
 
 static QByteArray buildArtRdmPacket(const QByteArray &rdmPayload) {
     QByteArray pkt;
@@ -2782,6 +2887,24 @@ static QByteArray buildArtRdmPacket(const QByteArray &rdmPayload) {
 
 void ArtNetRecorderMainWindow::startRdmTestRx() {
     if (m_rdmListening) return;
+
+    // 串口传输: "监听"即打开 RDM 串口 (读写模式, 半双工收发同口)
+    if (m_cmbRdmTransport && m_cmbRdmTransport->currentIndex() == 1) {
+        if (!rdmSerialOpen()) return;
+        m_rdmListening = true;
+        m_rdmRxCount = 0;
+        m_rdmOtherCount = 0;
+        m_rdmRespIntervalUs = 0;
+        m_rdmLastPayload.clear();
+        if (m_btnRdmListen) m_btnRdmListen->setText(tr("■ 关闭串口"));
+        if (m_lblRdmState)
+            m_lblRdmState->setText(tr("<span style='color:#00d4ff'>串口监听中 ← %1</span>")
+                                       .arg(m_cmbRdmSerial->currentData().toString()));
+        appendLog(tr("RDM 测试: 串口 %1 已打开 (250000 8N2, E1.20 半双工)")
+                      .arg(m_cmbRdmSerial->currentData().toString()), "info");
+        return;
+    }
+
     m_rdmTestRxSock = new QUdpSocket(this);
     if (!m_rdmTestRxSock->bind(QHostAddress(QHostAddress::AnyIPv4), ArtNet::DEFAULT_PORT,
                                QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
@@ -2805,44 +2928,135 @@ void ArtNetRecorderMainWindow::startRdmTestRx() {
 
 void ArtNetRecorderMainWindow::stopRdmTestRx() {
     if (!m_rdmListening) return;
+    // 串口应答器与主控端共用串口, 关串口前一并停止
+    if (m_rdmRespActive && m_cmbRdmTransport && m_cmbRdmTransport->currentIndex() == 1)
+        stopRdmResponder();
     if (m_rdmTestRxSock) {
         m_rdmTestRxSock->close();
         m_rdmTestRxSock->deleteLater();
         m_rdmTestRxSock = nullptr;
     }
+    if (m_rdmSerialSender) {
+        m_rdmSerialSender->close();
+        m_rdmSerialSender->deleteLater();
+        m_rdmSerialSender = nullptr;
+        m_rdmRxAccum.clear();
+    }
     m_rdmListening = false;
-    if (m_btnRdmListen) m_btnRdmListen->setText(tr("▶ 开始监听"));
+    const bool serial = m_cmbRdmTransport && m_cmbRdmTransport->currentIndex() == 1;
+    if (m_btnRdmListen)
+        m_btnRdmListen->setText(serial ? tr("▶ 打开串口") : tr("▶ 开始监听"));
     if (m_lblRdmState)
         m_lblRdmState->setText(tr("<span style='color:#8fb3d9'>已停止</span>"));
     appendLog(tr("RDM 测试: 停止监听 (共接收 %1 包)").arg(m_rdmRxCount), "info");
 }
 
-void ArtNetRecorderMainWindow::sendRdmTestRequest(bool discovery) {
-    if (!m_rdmTestTxSock) {
-        m_rdmTestTxSock = new QUdpSocket(this);
-        if (!m_rdmTestTxSock->bind(QHostAddress(QHostAddress::AnyIPv4), 0, QUdpSocket::ShareAddress)) {
-            appendLog(tr("RDM 测试: 发送 socket 绑定失败 (%1)").arg(m_rdmTestTxSock->errorString()), "error");
-            delete m_rdmTestTxSock;
-            m_rdmTestTxSock = nullptr;
+bool ArtNetRecorderMainWindow::ensureRdmTxSock() {
+    if (m_rdmTestTxSock) return true;
+    m_rdmTestTxSock = new QUdpSocket(this);
+    if (!m_rdmTestTxSock->bind(QHostAddress(QHostAddress::AnyIPv4), 0, QUdpSocket::ShareAddress)) {
+        appendLog(tr("RDM 测试: 发送 socket 绑定失败 (%1)").arg(m_rdmTestTxSock->errorString()), "error");
+        delete m_rdmTestTxSock;
+        m_rdmTestTxSock = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// 按 E1.20 帧格式构造 RDM 请求, 经 ArtRDM (UDP) 或 DMX512 串口发出
+void ArtNetRecorderMainWindow::rdmSendRequest(quint64 destUid, quint8 cc, quint16 pid,
+                                              const QByteArray &params) {
+    const int pdl = int(params.size());
+
+    // ---- 串口传输: E1.20 线上帧 (起始码 + 长度 + 头 + 数据 + 校验和) ----
+    // 常规包: 0xCC, 长度=24+PDL, 线上共 23+PDL 字节; 发现请求: 起始码 0xFF, BREAK ≥176μs
+    if (m_cmbRdmTransport && m_cmbRdmTransport->currentIndex() == 1) {
+        if (!m_rdmSerialSender || !m_rdmSerialSender->isOpen()) {
+            appendLog(tr("RDM 测试: 串口未打开, 请先点击「打开串口」"), "error");
             return;
         }
+        const bool disc = (cc == kCcDiscovery);
+        QByteArray w(23 + pdl, 0);
+        w[0] = char(disc ? 0xFF : 0xCC);
+        w[1] = char(24 + pdl);
+        for (int i = 0; i < 6; ++i)                       // Dest UID (大端)
+            w[2 + i] = char((destUid >> (40 - i * 8)) & 0xFF);
+        for (int i = 0; i < 6; ++i)                       // Source UID = 本机控制器
+            w[8 + i] = char(kRdmTestUid[i]);
+        w[14] = 0; w[15] = 1;                             // Version Number = 0x0001
+        w[16] = 0;                                        // Flags
+        w[17] = char(cc);                                 // Command Class (E1.20-2018)
+        w[18] = char(pid >> 8); w[19] = char(pid & 0xFF); // PID (大端)
+        w[20] = char(pdl);                                // PDL
+        if (pdl > 0)
+            std::memcpy(w.data() + 21, params.constData(), pdl);
+        quint16 sum = 0;                                  // 校验和: 起始码~数据末尾求和 (大端)
+        for (int i = 0; i < 21 + pdl; ++i) sum = quint16(sum + uchar(w[i]));
+        w[21 + pdl] = char(sum >> 8);
+        w[22 + pdl] = char(sum & 0xFF);
+
+        if (!m_rdmSerialSender->sendRdmFrame(w, disc ? 200 : 100)) {
+            appendLog(tr("RDM 测试: 串口发送失败 (%1)")
+                          .arg(m_rdmSerialSender->portName()), "error");
+            return;
+        }
+        m_rdmTxCount++;
+        m_rdmLastReqUs = QDateTime::currentMSecsSinceEpoch() * 1000;
+        appendLog(tr("RDM 测试: 发送 cc=0x%1 pid=0x%2 pdl=%3 → 串口 %4")
+                      .arg(cc, 2, 16, QChar('0')).arg(pid, 4, 16, QChar('0'))
+                      .arg(pdl).arg(m_rdmSerialSender->portName()), "info");
+        return;
     }
+
+    // ---- ArtRDM (UDP) 传输 ----
+    if (!ensureRdmTxSock()) return;
     const QHostAddress target(m_rdmTestIp->text().trimmed());
     if (target.isNull()) {
         appendLog(tr("RDM 测试: 目标 IP 无效"), "error");
         return;
     }
+    QByteArray rdm(25 + pdl, 0);
+    rdm[0] = char(0xCC);                            // Start code
+    rdm[1] = char(0x01);                            // Sub start code
+    const quint16 msgLen = quint16(21 + pdl);       // 长度字段之后的字节数 (大端)
+    rdm[2] = char(msgLen >> 8);
+    rdm[3] = char(msgLen & 0xFF);
+    for (int i = 0; i < 6; ++i)                     // Dest UID (大端)
+        rdm[4 + i] = char((destUid >> (40 - i * 8)) & 0xFF);
+    for (int i = 0; i < 6; ++i)                     // Source UID = 本机控制器
+        rdm[10 + i] = char(kRdmTestUid[i]);
+    rdm[16] = char(++m_rdmTransaction);             // Transaction number
+    rdm[17] = 0;                                    // Port ID
+    rdm[18] = 0;                                    // Message count
+    rdm[19] = 0; rdm[20] = 0;                       // Sub device (0 = 主设备)
+    rdm[21] = char(cc);                             // Command class
+    rdm[22] = char(pid >> 8);                       // PID (大端)
+    rdm[23] = char(pid & 0xFF);
+    rdm[24] = char(pdl);                            // PDL
+    if (pdl > 0)
+        std::memcpy(rdm.data() + 25, params.constData(), pdl);
+
+    const QByteArray pkt = buildArtRdmPacket(rdm);
     const quint16 port = quint16(m_rdmTestPort->value());
-    const QByteArray pkt = buildArtRdmPacket(buildRdmRequestPayload(discovery));
     if (m_rdmTestTxSock->writeDatagram(pkt, target, port) <= 0) {
         appendLog(tr("RDM 测试: 发送失败 (%1)").arg(m_rdmTestTxSock->errorString()), "error");
         return;
     }
     m_rdmTxCount++;
     m_rdmLastReqUs = QDateTime::currentMSecsSinceEpoch() * 1000;
-    appendLog(tr("RDM 测试: 发送 %1 → %2:%3")
-                  .arg(discovery ? "DISC_UNIQUE_BRANCH" : "GET DEVICE_INFO")
-                  .arg(target.toString()).arg(port), "info");
+    appendLog(tr("RDM 测试: 发送 cc=0x%1 pid=0x%2 pdl=%3 → %4:%5")
+                  .arg(cc, 2, 16, QChar('0')).arg(pid, 4, 16, QChar('0'))
+                  .arg(pdl).arg(target.toString()).arg(port), "info");
+}
+
+void ArtNetRecorderMainWindow::sendRdmTestRequest(bool discovery) {
+    if (discovery) {
+        QByteArray params(12, 0);                   // lower=00.., upper=FF..
+        for (int i = 0; i < 6; ++i) params[6 + i] = char(0xFF);
+        rdmSendRequest(0xFFFFFFFFFFFFull, kCcDiscovery, kPidDiscUniqueBranch, params);
+    } else {
+        rdmSendRequest(0xFFFFFFFFFFFFull, kCcGet, kPidDeviceInfo);
+    }
 }
 
 void ArtNetRecorderMainWindow::onRdmTestRx() {
@@ -2860,30 +3074,419 @@ void ArtNetRecorderMainWindow::onRdmTestRx() {
         const quint16 op = quint16(d[8] | (d[9] << 8));
         if (op != 0x6000 && op != 0x6100) { m_rdmOtherCount++; continue; }
 
-        int off = 12;                                  // ArtRDM: RDM ver 之后
+        int off = 13;                                  // ArtRDM: Id8+Op2+Ver2+RDMVer1 之后
         if (op == 0x6100) off += 2;                    // ArtRDMSub: 额外 2 字节 universe
         if (data.size() < off + 3) continue;
-        if (uchar(data[off]) != 0xCC || uchar(data[off + 1]) != 0x01) continue;
+        const uchar sub = uchar(data[off + 1]);
+        if (uchar(data[off]) != 0xCC || (sub != 0x01 && sub != 0x20)) continue;
 
-        m_rdmRxCount++;
-        const qint64 nowUs = QDateTime::currentMSecsSinceEpoch() * 1000;
-        if (m_rdmLastReqUs > 0) m_rdmRespIntervalUs = nowUs - m_rdmLastReqUs;
-        m_rdmLastPayload = data.mid(off, 32);
+        const int avail = data.size() - off;
+        rdmProcessResponse(reinterpret_cast<const uchar*>(data.constData()) + off,
+                           qMin(avail, 24 + 231));
+    }
+}
 
-        if (m_rdmLastPayload.size() >= 16) {
-            const auto *r = reinterpret_cast<const uchar*>(m_rdmLastPayload.constData());
-            QString uid;
-            for (int i = 0; i < 6; ++i)
-                uid += QString("%1%2").arg(r[10 + i] >> 4, 1, 16)
-                                      .arg(r[10 + i] & 0x0F, 1, 16)
-                                      .toUpper() + (i < 5 ? ":" : "");
-            if (m_lblRdmSrcUid) m_lblRdmSrcUid->setText(uid);
+// 统一应答处理: r 为 ArtRDM 布局
+// ([0]=0xCC [1]=sub [10..15]=来源 UID [21]=cc [22..23]=PID [24]=PDL [25..]=数据)
+// UDP 路径直接切片传入; 串口路径先把 E1.20 线上帧归一化成该布局再传入
+void ArtNetRecorderMainWindow::rdmProcessResponse(const uchar *r, int size) {
+    const quint8 sub = r[1];
+    m_rdmRxCount++;
+    const qint64 nowUs = QDateTime::currentMSecsSinceEpoch() * 1000;
+    if (m_rdmLastReqUs > 0) m_rdmRespIntervalUs = nowUs - m_rdmLastReqUs;
+    m_rdmLastPayload = QByteArray(reinterpret_cast<const char*>(r), size);
+
+    if (size >= 16 && m_lblRdmSrcUid)
+        m_lblRdmSrcUid->setText(rdmUidStr(rdmParseUid(r + 10)));
+    if (m_lblRdmHex)
+        m_lblRdmHex->setText(m_rdmLastPayload.toHex(' ').toUpper());
+
+    if (sub == 0x20) {
+        // 发现响应: 记录命中 UID, 由发现状态机判定唯一/冲突
+        if (m_rdmDiscRunning && size >= 16) {
+            const quint64 uid = rdmParseUid(r + 10);
+            if (!m_rdmDiscHits.contains(uid)) m_rdmDiscHits << uid;
         }
-        if (m_lblRdmHex) {
-            QString hex = m_rdmLastPayload.toHex(' ').toUpper();
-            m_lblRdmHex->setText(hex);
+    } else if (size >= 25) {
+        rdmHandleResponse(r, size);
+    }
+}
+
+// 串口 RDM 接收: UART 只见字节流, 按起始码组帧
+//   0xCC 常规应答: 线上总长 = 长度字节 - 1 (= 23 + PDL)
+//   0xFF 发现应答: 固定 16 字节 (FF 18 + 12 掩码位 + 2 校验和)
+// 校验和验证 + 过滤本机回显后, 归一化为 ArtRDM 布局交给 rdmProcessResponse
+void ArtNetRecorderMainWindow::onRdmSerialRx() {
+    if (!m_rdmSerialSender) return;
+    m_rdmRxAccum.append(m_rdmSerialSender->readAvailable());
+
+    auto *buf = reinterpret_cast<uchar*>(m_rdmRxAccum.data());
+    const int n = m_rdmRxAccum.size();
+    int pos = 0;
+    while (pos < n) {
+        while (pos < n && buf[pos] != 0xCC && buf[pos] != 0xFF) ++pos;   // 找起始码
+        if (pos >= n) break;
+        const quint64 ctrlUid = rdmParseUid(kRdmTestUid);
+
+        if (buf[pos] == 0xCC) {
+            if (n - pos < 2) break;                        // 等长度字节
+            const int total = int(buf[pos + 1]) - 1;       // 线上总字节数
+            if (total < 23 || total > 255) { ++pos; continue; }    // 假同步: 跳 1 字节重找
+            if (n - pos < total) break;                    // 等齐整包
+            const uchar *p = buf + pos;
+            quint16 sum = 0;
+            for (int i = 0; i < total - 2; ++i) sum = quint16(sum + p[i]);
+            const quint16 rxSum = quint16((p[total - 2] << 8) | p[total - 1]);
+            if (sum != rxSum) {
+                m_rdmOtherCount++;                         // 校验失败, 丢弃
+            } else {
+                const int pdl = qMin(int(p[20]), total - 21);
+                QByteArray norm(25 + pdl, 0);
+                norm[0] = char(0xCC); norm[1] = char(0x01);
+                norm[2] = char((21 + pdl) >> 8); norm[3] = char((21 + pdl) & 0xFF);
+                std::memcpy(norm.data() + 4, p + 2, 12);   // Dest + Source UID
+                norm[21] = char(p[17]);                    // Command Class
+                norm[22] = char(p[18]); norm[23] = char(p[19]);   // PID
+                norm[24] = char(pdl);
+                if (pdl > 0) std::memcpy(norm.data() + 25, p + 21, pdl);
+                const uchar *nr = reinterpret_cast<const uchar*>(norm.constData());
+                // 应答器启用: 发给本模拟灯具的请求 → 自动应答; 否则按主控端应答处理
+                if (!(m_rdmRespActive && rdmHandleRequest(nr, norm.size(), true, QHostAddress()))
+                    && rdmParseUid(p + 8) != ctrlUid)      // 过滤本机 TX 回显
+                    rdmProcessResponse(nr, norm.size());
+            }
+            pos += total;
+        } else {   // 0xFF 发现帧
+            // 应答器启用: 优先按 35 字节发现请求解析 (FF 18 + 头 + 12 边界 + 校验和)
+            if (m_rdmRespActive && n - pos >= 35) {
+                const uchar *p = buf + pos;
+                quint16 sum = 0;
+                for (int i = 0; i < 33; ++i) sum = quint16(sum + p[i]);
+                const quint16 rxSum = quint16((p[33] << 8) | p[34]);
+                if (p[1] == 0x18 && p[17] == kCcDiscovery && p[18] == 0x00
+                    && (p[19] == 0x01 || p[19] == 0x02) && p[20] == 0x0C && sum == rxSum) {
+                    QByteArray norm(37, 0);
+                    norm[0] = char(0xCC); norm[1] = char(0x01);
+                    std::memcpy(norm.data() + 4, p + 2, 12);   // Dest + Source UID
+                    norm[21] = char(p[17]);
+                    norm[22] = char(p[18]); norm[23] = char(p[19]);
+                    norm[24] = char(0x0C);
+                    std::memcpy(norm.data() + 25, p + 21, 12); // lower/upper 边界
+                    rdmHandleRequest(reinterpret_cast<const uchar*>(norm.constData()),
+                                     norm.size(), true, QHostAddress());
+                    pos += 35;
+                    continue;
+                }
+            }
+            if (n - pos < 16) break;                        // 等齐发现应答
+            const uchar *p = buf + pos;
+            quint16 sum = 0;
+            for (int i = 0; i < 14; ++i) sum = quint16(sum + p[i]);
+            const quint16 rxSum = quint16((p[14] << 8) | p[15]);
+            if (sum != rxSum) {
+                m_rdmOtherCount++;
+            } else {
+                // 去奇偶掩码还原 UID: 12 字节 × 7 数据位 (高位在前), 最高 48 位即 UID
+                quint64 stream = 0;
+                for (int k = 0; k < 12; ++k)
+                    stream = (stream << 7) | ((p[2 + k] >> 1) & 0x7F);
+                const quint64 uid = stream >> 36;
+                if (uid != ctrlUid) {
+                    QByteArray norm(25, 0);
+                    norm[0] = char(0xCC); norm[1] = char(0x20);
+                    for (int i = 0; i < 6; ++i)
+                        norm[10 + i] = char((uid >> (40 - i * 8)) & 0xFF);
+                    rdmProcessResponse(reinterpret_cast<const uchar*>(norm.constData()),
+                                       norm.size());
+                }
+            }
+            pos += 16;
         }
     }
+    m_rdmRxAccum.remove(0, pos);
+}
+
+// 打开 RDM 串口 (读写模式); 已打开且端口相同则直接复用
+bool ArtNetRecorderMainWindow::rdmSerialOpen() {
+    const QString port = m_cmbRdmSerial ? m_cmbRdmSerial->currentData().toString() : QString();
+    if (port.isEmpty()) {
+        appendLog(tr("RDM 测试: 未选择串口"), "error");
+        return false;
+    }
+    if (m_rdmSerialSender && m_rdmSerialSender->isOpen()
+        && m_rdmSerialSender->portName() == port)
+        return true;
+    if (m_rdmSerialSender) {
+        m_rdmSerialSender->close();
+        m_rdmSerialSender->deleteLater();
+        m_rdmSerialSender = nullptr;
+    }
+    m_rdmSerialSender = new Dmx512Sender(this);
+    if (!m_rdmSerialSender->openRdm(port)) {
+        appendLog(tr("RDM 测试: 打开串口 %1 失败").arg(port), "error");
+        m_rdmSerialSender->deleteLater();
+        m_rdmSerialSender = nullptr;
+        return false;
+    }
+    connect(m_rdmSerialSender, &Dmx512Sender::rdmDataReady,
+            this, [this]{ onRdmSerialRx(); });
+    m_rdmRxAccum.clear();
+    return true;
+}
+
+void ArtNetRecorderMainWindow::refreshRdmSerialPorts() {
+    if (!m_cmbRdmSerial) return;
+    const QString keep = m_cmbRdmSerial->currentData().toString();
+    m_cmbRdmSerial->clear();
+    const auto ports = QSerialPortInfo::availablePorts();
+    for (const QSerialPortInfo &pi : ports)
+        m_cmbRdmSerial->addItem(pi.portName() + (pi.description().isEmpty()
+                                                     ? QString()
+                                                     : "  (" + pi.description() + ")"),
+                                pi.portName());
+    if (m_cmbRdmSerial->count() == 0)
+        m_cmbRdmSerial->addItem(tr("(无可用串口)"), QString());
+    const int idx = m_cmbRdmSerial->findData(keep);
+    if (idx >= 0) m_cmbRdmSerial->setCurrentIndex(idx);
+}
+
+// ============================================================
+// RDM 接收测试: 模拟灯具应答器 (被动接收控制器请求并自动应答)
+//   支持请求: DISC_UNIQUE_BRANCH/DISC_MUTE, GET/SET DMX512_ADDRESS,
+//   GET DEVICE_INFO, GET STATUS_MESSAGES; 其余 GET/SET 回 NACK
+// ============================================================
+quint64 ArtNetRecorderMainWindow::rdmFixtureUid() const {
+    QString s = m_editRdmFixUid ? m_editRdmFixUid->text() : QString();
+    s.remove(QLatin1Char(':')).remove(QLatin1Char(' ')).remove(QLatin1Char('-'));
+    bool ok = false;
+    const quint64 v = s.toULongLong(&ok, 16);
+    return ok ? (v & 0xFFFFFFFFFFFFull) : 0x475301000001ull;
+}
+
+// UID → 发现应答 12 字节掩码: 84bit 流 (48bit UID 高位在前 + 36bit 交替填充),
+// 每字节 7 数据位 + 低 1 位偶校验
+void ArtNetRecorderMainWindow::rdmMaskedUid(quint64 uid, uchar *out12) {
+    const quint64 stream = (uid << 36) | 0x55555555ull;
+    for (int k = 0; k < 12; ++k) {
+        const uchar bits = uchar((stream >> (83 - 7 * k)) & 0x7F);
+        int p = 0;
+        for (int b = 0; b < 7; ++b) p += (bits >> b) & 1;
+        out12[k] = uchar((bits << 1) | (p & 1));
+    }
+}
+
+// E1.20 线上帧: 起始码 + 长度(24+PDL) + 头 + 数据 + 校验和 (大端)
+QByteArray ArtNetRecorderMainWindow::rdmWireFrame(quint8 startCode, quint64 destUid, quint64 srcUid,
+                                                 quint8 cc, quint16 pid, const QByteArray &params) {
+    const int pdl = params.size();
+    QByteArray w(23 + pdl, 0);
+    w[0] = char(startCode);
+    w[1] = char(24 + pdl);
+    for (int i = 0; i < 6; ++i) w[2 + i] = char((destUid >> (40 - i * 8)) & 0xFF);
+    for (int i = 0; i < 6; ++i) w[8 + i] = char((srcUid >> (40 - i * 8)) & 0xFF);
+    w[14] = 0; w[15] = 1;                             // Version Number = 0x0001
+    w[16] = 0;                                        // Flags
+    w[17] = char(cc);                                 // Command Class
+    w[18] = char(pid >> 8); w[19] = char(pid & 0xFF);
+    w[20] = char(pdl);
+    if (pdl > 0) std::memcpy(w.data() + 21, params.constData(), pdl);
+    quint16 sum = 0;
+    for (int i = 0; i < 21 + pdl; ++i) sum = quint16(sum + uchar(w[i]));
+    w[21 + pdl] = char(sum >> 8);
+    w[22 + pdl] = char(sum & 0xFF);
+    return w;
+}
+
+// 构造 ArtRDM 布局应答 (来源 UID = 模拟灯具)
+QByteArray ArtNetRecorderMainWindow::rdmFixtureResponse(quint8 cc, quint16 pid,
+                                                        const QByteArray &params,
+                                                        quint64 destUid, quint8 txn, quint8 sub) {
+    const quint64 src = rdmFixtureUid();
+    const int pdl = params.size();
+    QByteArray r(25 + pdl, 0);
+    r[0] = char(0xCC); r[1] = char(sub);
+    r[2] = char((21 + pdl) >> 8); r[3] = char((21 + pdl) & 0xFF);
+    for (int i = 0; i < 6; ++i) {
+        r[4 + i]  = char((destUid >> (40 - i * 8)) & 0xFF);
+        r[10 + i] = char((src >> (40 - i * 8)) & 0xFF);
+    }
+    r[16] = char(txn);
+    r[21] = char(cc);
+    r[22] = char(pid >> 8); r[23] = char(pid & 0xFF);
+    r[24] = char(pdl);
+    if (pdl > 0) std::memcpy(r.data() + 25, params.constData(), pdl);
+    return r;
+}
+
+// 解析请求并自动应答 (r 为 ArtRDM 布局); 返回 true 表示该帧是发给本模拟灯具的请求
+bool ArtNetRecorderMainWindow::rdmHandleRequest(const uchar *r, int size, bool viaSerial,
+                                                const QHostAddress &peer) {
+    if (size < 25) return false;
+    const quint64 dest = rdmParseUid(r + 4);
+    const quint64 src  = rdmParseUid(r + 10);
+    const quint8  txn  = r[16];
+    const quint8  cc   = r[21];
+    const quint16 pid  = quint16((r[22] << 8) | r[23]);
+    const int     pdl  = qMin(int(r[24]), size - 25);
+    if (cc != kCcGet && cc != kCcSet && cc != kCcDiscovery) return false;   // 应答帧不处理
+    const quint64 fixUid = rdmFixtureUid();
+    if (dest != fixUid && dest != 0xFFFFFFFFFFFFull) return false;          // 非发给本灯具
+
+    m_rdmReqCount++;
+    QString desc;
+    QByteArray rp;
+    quint8 rcc = kCcGetAck;
+    quint8 rsub = 0x01;
+    bool discResp = false;
+    if (cc == kCcDiscovery && pid == kPidDiscUniqueBranch) {
+        if (pdl >= 12) {
+            const quint64 lo = rdmParseUid(r + 25), hi = rdmParseUid(r + 31);
+            if (fixUid < lo || fixUid > hi) {
+                desc = tr("发现 UNIQUE_BRANCH: 不在 [%1, %2] 区间, 不应答")
+                           .arg(rdmUidStr(lo), rdmUidStr(hi));
+                if (m_lblRdmReqCount) m_lblRdmReqCount->setText(QString::number(m_rdmReqCount));
+                if (m_lblRdmReqInfo) m_lblRdmReqInfo->setText(desc);
+                return true;
+            }
+        }
+        discResp = true; rsub = 0x20; rcc = kCcDiscResponse;
+        desc = tr("发现 UNIQUE_BRANCH: 命中, 应答掩码 UID");
+    } else if (cc == kCcDiscovery && pid == 0x0002) {
+        rcc = kCcDiscResponse;
+        desc = tr("发现 MUTE: 应答");
+    } else if (cc == kCcGet && pid == kPidDmx512Address) {
+        const quint16 a = quint16(m_spinRdmFixAddr->value());
+        rp = QByteArray(2, 0);
+        rp[0] = char(a >> 8); rp[1] = char(a & 0xFF);
+        desc = tr("GET 地址 → %1").arg(a);
+    } else if (cc == kCcSet && pid == kPidDmx512Address) {
+        rcc = kCcSetAck;
+        if (pdl >= 2) {
+            const quint16 a = quint16((uchar(r[25]) << 8) | uchar(r[26]));
+            m_spinRdmFixAddr->setValue(a);
+            desc = tr("SET 地址 → %1 (已生效)").arg(a);
+        } else {
+            rcc = kCcSetNak;
+            desc = tr("SET 地址: 参数长度不足, NACK");
+        }
+    } else if (cc == kCcGet && pid == kPidDeviceInfo) {
+        rp = QByteArray::fromHex("0102000001001000");   // 主1.2 / 0子设备 / 1端口 / footprint 16
+        desc = tr("GET DEVICE_INFO: 应答固件 1.2");
+    } else if (cc == kCcGet && pid == kPidStatusMessages) {
+        desc = tr("GET STATUS_MESSAGES: 应答无故障");
+    } else if (cc == kCcGet) {
+        rcc = kCcGetNak;
+        desc = tr("GET pid=0x%1: 不支持, NACK").arg(pid, 4, 16, QChar('0')).toUpper();
+    } else {
+        rcc = kCcSetNak;
+        desc = tr("SET pid=0x%1: 不支持, NACK").arg(pid, 4, 16, QChar('0')).toUpper();
+    }
+
+    if (m_lblRdmReqCount) m_lblRdmReqCount->setText(QString::number(m_rdmReqCount));
+    if (m_lblRdmReqInfo)  m_lblRdmReqInfo->setText(desc);
+    if (m_lblRdmReqHex)
+        m_lblRdmReqHex->setText(QByteArray(reinterpret_cast<const char*>(r), size)
+                                    .toHex(' ').toUpper());
+
+    bool sent = false;
+    if (viaSerial) {
+        if (m_rdmSerialSender && m_rdmSerialSender->isOpen()) {
+            QByteArray w;
+            if (discResp) {
+                w = QByteArray(16, 0);
+                w[0] = char(0xFF); w[1] = char(0x18);
+                rdmMaskedUid(fixUid, reinterpret_cast<uchar*>(w.data()) + 2);
+                quint16 sum = 0;
+                for (int i = 0; i < 14; ++i) sum = quint16(sum + uchar(w[i]));
+                w[14] = char(sum >> 8); w[15] = char(sum & 0xFF);
+                sent = m_rdmSerialSender->sendRdmFrame(w, 200);
+            } else {
+                sent = m_rdmSerialSender->sendRdmFrame(
+                    rdmWireFrame(0xCC, src, fixUid, rcc, pid, rp), 100);
+            }
+        }
+    } else if (m_rdmReqSock) {
+        const QByteArray payload = rdmFixtureResponse(
+            rcc, pid, discResp ? QByteArray() : rp, src, txn, rsub);
+        sent = m_rdmReqSock->writeDatagram(buildArtRdmPacket(payload),
+                                          peer, quint16(ArtNet::DEFAULT_PORT)) > 0;
+    }
+    if (sent) {
+        m_rdmRespSent++;
+        if (m_lblRdmRespSent) m_lblRdmRespSent->setText(QString::number(m_rdmRespSent));
+    }
+    return true;
+}
+
+void ArtNetRecorderMainWindow::onRdmReqRx() {
+    if (!m_rdmReqSock) return;
+    while (m_rdmReqSock->hasPendingDatagrams()) {
+        const QNetworkDatagram dg = m_rdmReqSock->receiveDatagram();
+        const QByteArray data = dg.data();
+        if (data.size() < 16 || data.left(8) != QByteArray("Art-Net", 8)) continue;
+        const quint16 op = quint16(uchar(data[8]) | (uchar(data[9]) << 8));
+        if (op != 0x6000 && op != 0x6100) continue;
+        int off = 13;
+        if (op == 0x6100) off += 2;
+        if (data.size() < off + 3) continue;
+        if (uchar(data[off]) != 0xCC) continue;
+        const uchar sub = uchar(data[off + 1]);
+        if (sub != 0x01 && sub != 0x20) continue;
+        rdmHandleRequest(reinterpret_cast<const uchar*>(data.constData()) + off,
+                         data.size() - off, false, dg.senderAddress());
+    }
+}
+
+void ArtNetRecorderMainWindow::startRdmResponder() {
+    if (m_rdmRespActive) return;
+    const bool serial = m_cmbRdmTransport && m_cmbRdmTransport->currentIndex() == 1;
+    if (serial) {
+        // 串口应答器与主控端共用同一读写串口 (半双工同线)
+        if (!rdmSerialOpen()) return;
+        m_rdmRespActive = true;
+        m_rdmReqCount = m_rdmRespSent = 0;
+        if (m_btnRdmResp) m_btnRdmResp->setText(tr("■ 停止应答"));
+        if (m_lblRdmRespState)
+            m_lblRdmRespState->setText(tr("<span style='color:#00d4ff'>应答中 ← 串口 %1</span>")
+                                           .arg(m_rdmSerialSender->portName()));
+        appendLog(tr("RDM 接收测试: 模拟灯具 %1 在串口 %2 应答")
+                      .arg(rdmUidStr(rdmFixtureUid()), m_rdmSerialSender->portName()), "info");
+        return;
+    }
+    m_rdmReqSock = new QUdpSocket(this);
+    const quint16 port = quint16(m_spinRdmRespPort->value());
+    if (!m_rdmReqSock->bind(QHostAddress(QHostAddress::AnyIPv4), port,
+                            QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
+        appendLog(tr("RDM 接收测试: 绑定 UDP %1 失败 (%2)")
+                      .arg(port).arg(m_rdmReqSock->errorString()), "error");
+        m_rdmReqSock->deleteLater();
+        m_rdmReqSock = nullptr;
+        return;
+    }
+    connect(m_rdmReqSock, &QUdpSocket::readyRead, this, [this]{ onRdmReqRx(); });
+    m_rdmRespActive = true;
+    m_rdmReqCount = m_rdmRespSent = 0;
+    if (m_btnRdmResp) m_btnRdmResp->setText(tr("■ 停止应答"));
+    if (m_lblRdmRespState)
+        m_lblRdmRespState->setText(tr("<span style='color:#00d4ff'>应答中 ← UDP %1</span>").arg(port));
+    appendLog(tr("RDM 接收测试: 模拟灯具 %1 监听 UDP %2, 应答发回请求方 6454")
+                  .arg(rdmUidStr(rdmFixtureUid())).arg(port), "info");
+}
+
+void ArtNetRecorderMainWindow::stopRdmResponder() {
+    if (!m_rdmRespActive) return;
+    if (m_rdmReqSock) {
+        m_rdmReqSock->close();
+        m_rdmReqSock->deleteLater();
+        m_rdmReqSock = nullptr;
+    }
+    m_rdmRespActive = false;
+    if (m_btnRdmResp) m_btnRdmResp->setText(tr("▶ 开始应答"));
+    if (m_lblRdmRespState)
+        m_lblRdmRespState->setText(tr("<span style='color:#8fb3d9'>已停止 (请求 %1 / 应答 %2)</span>")
+                                       .arg(m_rdmReqCount).arg(m_rdmRespSent));
+    appendLog(tr("RDM 接收测试: 停止应答 (请求 %1 / 应答 %2)")
+                  .arg(m_rdmReqCount).arg(m_rdmRespSent), "info");
 }
 
 void ArtNetRecorderMainWindow::updateRdmTestStats() {
@@ -2901,8 +3504,15 @@ QWidget *ArtNetRecorderMainWindow::buildPageRdmTest() {
     root->setContentsMargins(0, 0, 0, 0);
     root->setSpacing(10);
 
-    auto *hint = new QLabel(tr("RDM 测试 — 通过 ArtRDM (OpCode 0x6000) 发送发现 / 设备信息请求，并监听 UDP 6454 接收应答。"
-                               "RDM 依赖网关或支持 RDM 的设备应答；没有真实 RDM 设备时只会增加发送请求数。"));
+    auto *hint = new QLabel(tr("RDM 测试 — 支持两种传输：ArtRDM (OpCode 0x6000, UDP 6454, 经网关) 与 "
+                               "DMX512 串口 (USB-DMX/RS-485 直连灯具线, E1.20 线上格式, 同一串口半双工"
+                               "发请求收应答; 常规包起始码 0xCC, 发现请求/应答 0xFF)。发送发现 / 设备信息 / "
+                               "地址设置 / 故障查询请求并接收应答。「发现灯具」用 DISC_UNIQUE_BRANCH 二分搜索"
+                               "统计数量与种类 (厂商 ID/协议版本)，随后自动 GET DMX512_ADDRESS (0x0120) "
+                               "与 STATUS_MESSAGES (0x0131)；可单选/全选灯具修改地址码与查询故障。"
+                               "接收测试: 可启动模拟灯具应答器, 被动接收外部控制器的 RDM 请求"
+                               " (发现/地址读写/设备信息/故障) 并自动应答, 无真实设备也能完整回环验证。"
+                               "没有真实 RDM 设备时主控端只会增加发送请求数。"));
     hint->setWordWrap(true);
     hint->setStyleSheet("color:#8fb3d9; font-size:12px;");
     root->addWidget(hint);
@@ -2934,6 +3544,32 @@ QWidget *ArtNetRecorderMainWindow::buildPageRdmTest() {
     cfg->addWidget(m_rdmTestPort, 0, 3);
     cfg->setColumnStretch(4, 1);
 
+    // 传输方式: ArtRDM 网口 / DMX512 串口 (E1.20 线上格式, 半双工)
+    auto *rowTx = new QHBoxLayout;
+    rowTx->setContentsMargins(0, 0, 0, 0);
+    m_cmbRdmTransport = new QComboBox;
+    m_cmbRdmTransport->addItem(tr("ArtRDM (UDP 网口)"));
+    m_cmbRdmTransport->addItem(tr("DMX512 (串口)"));
+    m_cmbRdmTransport->setMinimumWidth(150);
+    m_cmbRdmTransport->setToolTip(tr("ArtRDM: 经 Art-Net RDM 网关 (UDP 6454)<br>"
+                                     "DMX512 串口: USB-DMX/RS-485 直连灯具线, 同一串口发请求收应答<br>"
+                                     "(需适配器支持收发, 如 FT232 半双工方案)"));
+    m_cmbRdmSerial = new QComboBox;
+    m_cmbRdmSerial->setMinimumWidth(170);
+    m_cmbRdmSerial->setEnabled(false);
+    m_btnRdmSerialRefresh = new QPushButton(tr("刷新端口"));
+    m_btnRdmSerialRefresh->setProperty("action", "tool");
+    m_btnRdmSerialRefresh->setEnabled(false);
+    rowTx->addWidget(new QLabel(tr("传输方式:")));
+    rowTx->addWidget(m_cmbRdmTransport);
+    rowTx->addSpacing(12);
+    rowTx->addWidget(new QLabel(tr("串口:")));
+    rowTx->addWidget(m_cmbRdmSerial);
+    rowTx->addSpacing(8);
+    rowTx->addWidget(m_btnRdmSerialRefresh);
+    rowTx->addStretch();
+    cfg->addLayout(rowTx, 1, 0, 1, 5);
+
     auto *rowBtns = new QHBoxLayout;
     rowBtns->setContentsMargins(0, 0, 0, 0);
     rowBtns->addWidget(m_btnRdmListen);
@@ -2941,8 +3577,57 @@ QWidget *ArtNetRecorderMainWindow::buildPageRdmTest() {
     rowBtns->addWidget(m_btnRdmGetInfo);
     rowBtns->addWidget(m_lblRdmState);
     rowBtns->addStretch();
-    cfg->addLayout(rowBtns, 1, 0, 1, 5);
+    cfg->addLayout(rowBtns, 2, 0, 1, 5);
     root->addWidget(createCard(tr("目标与操作"), cfgBody), 0);
+
+    // ---- 接收测试 (模拟灯具应答器) ----
+    auto *respBody = new QWidget;
+    auto *resp = new QGridLayout(respBody);
+    resp->setContentsMargins(12, 8, 12, 10);
+    resp->setHorizontalSpacing(10);
+    resp->setVerticalSpacing(6);
+    m_btnRdmResp = new QPushButton(tr("▶ 开始应答"));
+    m_btnRdmResp->setProperty("action", "icon");
+    m_lblRdmRespState = new QLabel(tr("<span style='color:#8fb3d9'>已停止</span>"));
+    m_spinRdmRespPort = new QSpinBox;
+    m_spinRdmRespPort->setRange(1, 65535);
+    m_spinRdmRespPort->setValue(ArtNet::DEFAULT_PORT);
+    m_spinRdmRespPort->setToolTip(tr("应答器监听端口 (真实灯具默认监听 6454).<br>"
+                                     "应用内回环: 设为 6455 并把主控端「端口」也改为 6455,<br>"
+                                     "应答自动发回请求方 6454, 由主控端监听接收."));
+    m_editRdmFixUid = new QLineEdit(QStringLiteral("4753:01000001"));
+    m_editRdmFixUid->setToolTip(tr("模拟灯具 UID (十六进制 48bit, 厂商ID:设备编号, 冒号/空格可选)"));
+    m_spinRdmFixAddr = new QSpinBox;
+    m_spinRdmFixAddr->setRange(1, 512);
+    m_spinRdmFixAddr->setValue(1);
+    m_spinRdmFixAddr->setToolTip(tr("GET 地址应答值; 收到 SET 地址请求时自动更新"));
+    m_lblRdmReqCount = new QLabel(QStringLiteral("0"));
+    m_lblRdmRespSent = new QLabel(QStringLiteral("0"));
+    m_lblRdmReqInfo = new QLabel(tr("—"));
+    m_lblRdmReqInfo->setStyleSheet("color:#8fb3d9; font-size:12px;");
+    m_lblRdmReqHex = new QLabel(tr("—"));
+    m_lblRdmReqHex->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_lblRdmReqHex->setStyleSheet("font-family:Consolas,monospace; font-size:11px; color:#9fd89f;");
+    resp->addWidget(new QLabel(tr("监听端口:")), 0, 0);
+    resp->addWidget(m_spinRdmRespPort, 0, 1);
+    resp->addWidget(new QLabel(tr("灯具 UID:")), 0, 2);
+    resp->addWidget(m_editRdmFixUid, 0, 3);
+    resp->addWidget(new QLabel(tr("DMX 地址:")), 0, 4);
+    resp->addWidget(m_spinRdmFixAddr, 0, 5);
+    auto *rowResp = new QHBoxLayout;
+    rowResp->setContentsMargins(0, 0, 0, 0);
+    rowResp->addWidget(m_btnRdmResp);
+    rowResp->addWidget(m_lblRdmRespState);
+    rowResp->addStretch();
+    resp->addLayout(rowResp, 1, 0, 1, 6);
+    resp->addWidget(new QLabel(tr("收到请求:")), 2, 0);
+    resp->addWidget(m_lblRdmReqCount, 2, 1);
+    resp->addWidget(new QLabel(tr("自动应答:")), 2, 2);
+    resp->addWidget(m_lblRdmRespSent, 2, 3);
+    resp->addWidget(m_lblRdmReqInfo, 3, 0, 1, 6);
+    resp->addWidget(m_lblRdmReqHex, 4, 0, 1, 6);
+    resp->setColumnStretch(5, 1);
+    root->addWidget(createCard(tr("接收测试 (模拟灯具应答器)"), respBody), 0);
 
     // ---- 测试结果 ----
     auto *statBody = new QWidget;
@@ -2981,23 +3666,379 @@ QWidget *ArtNetRecorderMainWindow::buildPageRdmTest() {
     st->addWidget(m_lblRdmHex, 2, 0, 1, 5);
 
     root->addWidget(createCard(tr("测试结果 (请求 / 应答)"), statBody), 0);
+
+    // ---- 灯具发现列表 ----
+    auto *devBody = new QWidget;
+    auto *dv = new QVBoxLayout(devBody);
+    dv->setContentsMargins(0, 0, 0, 0);
+    dv->setSpacing(8);
+
+    auto *rowScan = new QHBoxLayout;
+    rowScan->setContentsMargins(0, 0, 0, 0);
+    m_btnRdmScan = new QPushButton(tr("🔍 发现灯具 (DISC 二分搜索)"));
+    m_btnRdmScan->setProperty("action", "icon");
+    m_btnRdmScan->setToolTip(tr("通过 DISC_UNIQUE_BRANCH 二分搜索 UID 全空间, 统计在线 RDM 灯具数量;\n"
+                                "发现后自动逐台 GET DMX512_ADDRESS / STATUS_MESSAGES / DEVICE_INFO."));
+    auto *capDev = new QLabel(tr("已发现灯具:"));
+    capDev->setStyleSheet("color:#8fb3d9; font-size:12px;");
+    m_lblRdmDevCount = new QLabel("0");
+    m_lblRdmDevCount->setStyleSheet("color:#00d4ff; font-size:16px; font-weight:bold; font-family:Consolas;");
+    rowScan->addWidget(m_btnRdmScan);
+    rowScan->addSpacing(16);
+    rowScan->addWidget(capDev);
+    rowScan->addWidget(m_lblRdmDevCount);
+    rowScan->addStretch();
+    dv->addLayout(rowScan);
+
+    m_tblRdmDevices = new QTableWidget(0, 5);
+    m_tblRdmDevices->setHorizontalHeaderLabels(
+        { tr("UID"), tr("厂商 ID"), tr("协议版本/子设备"), tr("DMX 地址"), tr("故障状态") });
+    m_tblRdmDevices->verticalHeader()->setVisible(false);
+    m_tblRdmDevices->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_tblRdmDevices->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_tblRdmDevices->horizontalHeader()->setStretchLastSection(true);
+    m_tblRdmDevices->setColumnWidth(0, 150);
+    m_tblRdmDevices->setColumnWidth(1, 90);
+    m_tblRdmDevices->setColumnWidth(2, 150);
+    m_tblRdmDevices->setColumnWidth(3, 90);
+    m_tblRdmDevices->setMinimumHeight(160);
+    m_tblRdmDevices->setMaximumHeight(240);
+    dv->addWidget(m_tblRdmDevices);
+    root->addWidget(createCard(tr("灯具发现 (数量 / 种类)"), devBody), 0);
+
+    // ---- 地址修改 / 故障查询 ----
+    auto *opBody = new QWidget;
+    auto *op = new QGridLayout(opBody);
+    op->setContentsMargins(0, 0, 0, 0);
+    op->setHorizontalSpacing(12);
+    op->setVerticalSpacing(8);
+
+    m_cmbRdmUid = new QComboBox;
+    m_cmbRdmUid->setMinimumWidth(170);
+    m_cmbRdmUid->setToolTip(tr("选择已发现的灯具 UID (先执行「发现灯具」)"));
+    m_spinRdmAddr = new QSpinBox;
+    m_spinRdmAddr->setRange(1, 512);
+    m_spinRdmAddr->setValue(1);
+    m_btnRdmSetAddr = new QPushButton(tr("✏ 修改地址码 (SET_DMX512_ADDRESS)"));
+    m_btnRdmSetAddr->setProperty("action", "icon");
+    m_btnRdmStatus = new QPushButton(tr("⚠ 查询选中灯具故障"));
+    m_btnRdmStatus->setProperty("action", "icon");
+    m_btnRdmStatusAll = new QPushButton(tr("⚠ 查询全部灯具故障"));
+    m_btnRdmStatusAll->setProperty("action", "icon");
+    m_lblRdmOpResult = new QLabel(tr("<span style='color:#8fb3d9'>等待操作…</span>"));
+    m_lblRdmOpResult->setWordWrap(true);
+
+    op->addWidget(new QLabel(tr("灯具 UID:")), 0, 0);
+    op->addWidget(m_cmbRdmUid, 0, 1);
+    op->addWidget(new QLabel(tr("新地址:")), 0, 2);
+    op->addWidget(m_spinRdmAddr, 0, 3);
+    op->addWidget(m_btnRdmSetAddr, 0, 4);
+    op->addWidget(m_btnRdmStatus, 1, 1);
+    op->addWidget(m_btnRdmStatusAll, 1, 2, 1, 2);
+    op->setColumnStretch(5, 1);
+    op->addWidget(m_lblRdmOpResult, 2, 0, 1, 6);
+    root->addWidget(createCard(tr("地址码修改 / 故障查询"), opBody), 0);
+
     root->addStretch();
 
-    m_rdmTestStatTimer = new QTimer(this);
-    connect(m_rdmTestStatTimer, &QTimer::timeout, this, [this]{ updateRdmTestStats(); });
-    m_rdmTestStatTimer->start(300);
+    // 发现/查询步进定时器 (单发, 超时进入下一步)
+    m_rdmDiscTimer = new QTimer(this);
+    m_rdmDiscTimer->setSingleShot(true);
+    connect(m_rdmDiscTimer, &QTimer::timeout, this, [this]{ rdmDiscoveryStep(); });
+    m_rdmQueryTimer = new QTimer(this);
+    m_rdmQueryTimer->setSingleShot(true);
+    connect(m_rdmQueryTimer, &QTimer::timeout, this, [this]{ rdmQueryStep(); });
+
+    // 统计刷新交给调度器统计组 (仅本页可见时执行)
+    addStatTask(page, [this]{ updateRdmTestStats(); });
 
     connect(m_btnRdmListen, &QPushButton::clicked, this, [this]{
         if (m_rdmListening) stopRdmTestRx();
         else startRdmTestRx();
     });
+    connect(m_btnRdmResp, &QPushButton::clicked, this, [this]{
+        if (m_rdmRespActive) stopRdmResponder();
+        else startRdmResponder();
+    });
+    connect(m_btnRdmSerialRefresh, &QPushButton::clicked, this, [this]{ refreshRdmSerialPorts(); });
+    connect(m_cmbRdmTransport, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int idx){
+        // 切换传输先停当前通道; 串口模式下网关 IP/端口配置禁用
+        if (m_rdmListening) stopRdmTestRx();
+        if (m_rdmRespActive) stopRdmResponder();
+        const bool serial = idx == 1;
+        m_rdmTestIp->setEnabled(!serial);
+        m_rdmTestPort->setEnabled(!serial);
+        m_cmbRdmSerial->setEnabled(serial);
+        m_btnRdmSerialRefresh->setEnabled(serial);
+        if (m_btnRdmListen)
+            m_btnRdmListen->setText(serial ? tr("▶ 打开串口") : tr("▶ 开始监听"));
+        if (serial) refreshRdmSerialPorts();
+    });
     connect(m_btnRdmDisc, &QPushButton::clicked, this, [this]{ sendRdmTestRequest(true); });
     connect(m_btnRdmGetInfo, &QPushButton::clicked, this, [this]{ sendRdmTestRequest(false); });
+    connect(m_btnRdmScan, &QPushButton::clicked, this, [this]{ rdmStartDiscovery(); });
+    connect(m_btnRdmSetAddr, &QPushButton::clicked, this, [this]{
+        const QVariant v = m_cmbRdmUid->currentData();
+        if (!v.isValid()) {
+            m_lblRdmOpResult->setText(tr("<span style='color:#ff9040'>请先「发现灯具」并选择 UID</span>"));
+            return;
+        }
+        const quint64 uid = v.toULongLong();
+        const quint16 addr = quint16(m_spinRdmAddr->value());
+        QByteArray params(2, 0);
+        params[0] = char(addr >> 8);
+        params[1] = char(addr & 0xFF);
+        rdmSendRequest(uid, kCcSet, kPidDmx512Address, params);
+        m_lblRdmOpResult->setText(tr("已发送 SET_DMX512_ADDRESS %1 → %2, 等待应答…")
+                                      .arg(rdmUidStr(uid)).arg(addr));
+    });
+    connect(m_btnRdmStatus, &QPushButton::clicked, this, [this]{
+        const QVariant v = m_cmbRdmUid->currentData();
+        if (!v.isValid()) {
+            m_lblRdmOpResult->setText(tr("<span style='color:#ff9040'>请先「发现灯具」并选择 UID</span>"));
+            return;
+        }
+        rdmEnqueueQueries(v.toULongLong(), { kPidStatusMessages });
+        if (m_rdmQueryTimer && !m_rdmQueryTimer->isActive()) rdmQueryStep();
+        m_lblRdmOpResult->setText(tr("已排队故障查询 (STATUS_MESSAGES)…"));
+    });
+    connect(m_btnRdmStatusAll, &QPushButton::clicked, this, [this]{
+        if (m_rdmFoundUids.isEmpty()) {
+            m_lblRdmOpResult->setText(tr("<span style='color:#ff9040'>尚未发现灯具, 请先执行发现</span>"));
+            return;
+        }
+        for (quint64 uid : m_rdmFoundUids)
+            rdmEnqueueQueries(uid, { kPidStatusMessages });
+        if (m_rdmQueryTimer && !m_rdmQueryTimer->isActive()) rdmQueryStep();
+        m_lblRdmOpResult->setText(tr("已为 %1 台灯具排队故障查询…").arg(m_rdmFoundUids.size()));
+    });
 
-    if (qEnvironmentVariableIntValue("ARTNET_UI_RDM_AUTOTEST") == 1)
+    if (qEnvironmentVariableIntValue("ARTNET_UI_RDM_AUTOTEST") == 1) {
         QTimer::singleShot(800, this, [this]{ startRdmTestRx(); sendRdmTestRequest(true); });
+        QTimer::singleShot(3500, this, [this]{ m_btnRdmScan->click(); });
+    }
+    // 应用内应答器回环: 模拟灯具监听 UDP 6455 (应答发回请求方 6454), 供外部脚本端到端验证
+    if (qEnvironmentVariableIntValue("ARTNET_UI_RDM_RESPONDER") == 1) {
+        QTimer::singleShot(600, this, [this]{
+            m_spinRdmRespPort->setValue(6455);
+            startRdmResponder();
+        });
+    }
 
     return page;
+}
+
+// ---- RDM 设备管理: UID 工具 ----
+QString ArtNetRecorderMainWindow::rdmUidStr(quint64 uid) {
+    QString s;
+    for (int i = 0; i < 6; ++i)
+        s += QString("%1%2").arg((uid >> (40 - i * 8)) & 0xF, 1, 16)
+                            .arg((uid >> (36 - i * 8)) & 0xF, 1, 16)
+                            .toUpper() + (i < 5 ? ":" : "");
+    return s;
+}
+
+quint64 ArtNetRecorderMainWindow::rdmParseUid(const uchar *p) {
+    quint64 uid = 0;
+    for (int i = 0; i < 6; ++i) uid = (uid << 8) | p[i];
+    return uid;
+}
+
+int ArtNetRecorderMainWindow::rdmDeviceRow(quint64 uid) const {
+    if (!m_tblRdmDevices) return -1;
+    const QString s = rdmUidStr(uid);
+    for (int i = 0; i < m_tblRdmDevices->rowCount(); ++i) {
+        const QTableWidgetItem *it = m_tblRdmDevices->item(i, 0);
+        if (it && it->text() == s) return i;
+    }
+    return -1;
+}
+
+void ArtNetRecorderMainWindow::rdmRefreshUidCombo() {
+    if (!m_cmbRdmUid) return;
+    m_cmbRdmUid->clear();
+    for (quint64 uid : m_rdmFoundUids)
+        m_cmbRdmUid->addItem(rdmUidStr(uid), QVariant::fromValue(uid));
+}
+
+// ---- 发现状态机: DISC_UNIQUE_BRANCH 二分搜索 ----
+void ArtNetRecorderMainWindow::rdmStartDiscovery() {
+    if (m_rdmDiscRunning) return;
+    if (!m_rdmListening) startRdmTestRx();
+    if (!m_rdmListening) {
+        m_lblRdmOpResult->setText(tr("<span style='color:#ff9040'>监听未启动, 无法发现</span>"));
+        return;
+    }
+    m_rdmDiscStack.clear();
+    m_rdmDiscHits.clear();
+    m_rdmFoundUids.clear();
+    m_rdmQueryQueue.clear();
+    m_rdmDiscSends = 0;
+    m_rdmDiscRunning = true;
+    m_rdmDiscStack.push_back({ 0, 0xFFFFFFFFFFFFull });
+    if (m_tblRdmDevices) m_tblRdmDevices->setRowCount(0);
+    rdmRefreshUidCombo();
+    m_lblRdmDevCount->setText("0");
+    m_btnRdmScan->setEnabled(false);
+    m_btnRdmScan->setText(tr("⏳ 发现中…"));
+    m_lblRdmOpResult->setText(tr("二分发现搜索开始 (上限 4000 次 DISC 请求 / 128 台设备)"));
+    appendLog(tr("RDM 发现: 开始 DISC_UNIQUE_BRANCH 二分搜索"), "info");
+    rdmDiscoveryStep();   // 首次直接发送区间栈顶请求
+}
+
+void ArtNetRecorderMainWindow::rdmDiscoveryStep() {
+    if (!m_rdmDiscRunning) return;
+
+    // 1) 判定上一轮响应: 0 命中丢弃区间, 1 命中确认设备, ≥2 分裂区间
+    if (m_rdmDiscSends > 0) {
+        if (m_rdmDiscHits.size() == 1) {
+            const quint64 uid = m_rdmDiscHits.first();
+            if (!m_rdmFoundUids.contains(uid)) {
+                m_rdmFoundUids << uid;
+                appendLog(tr("RDM 发现: 命中 UID %1").arg(rdmUidStr(uid)), "info");
+            }
+        } else if (m_rdmDiscHits.size() >= 2) {
+            const quint64 mid = m_rdmDiscLower + (m_rdmDiscUpper - m_rdmDiscLower) / 2;
+            m_rdmDiscStack.push_back({ m_rdmDiscLower, mid });
+            m_rdmDiscStack.push_back({ mid + 1, m_rdmDiscUpper });
+        }
+    }
+    m_rdmDiscHits.clear();
+
+    // 2) 取下一区间并发送
+    if (m_rdmDiscStack.isEmpty() || m_rdmDiscSends >= 4000 || m_rdmFoundUids.size() >= 128) {
+        rdmFinishDiscovery();
+        return;
+    }
+    const RdmUidRange rg = m_rdmDiscStack.takeLast();
+    m_rdmDiscLower = rg.lower;
+    m_rdmDiscUpper = rg.upper;
+    QByteArray params(12, 0);
+    for (int i = 0; i < 6; ++i) {
+        params[i]     = char((rg.lower >> (40 - i * 8)) & 0xFF);
+        params[6 + i] = char((rg.upper >> (40 - i * 8)) & 0xFF);
+    }
+    rdmSendRequest(0xFFFFFFFFFFFFull, kCcDiscovery, kPidDiscUniqueBranch, params);
+    m_rdmDiscSends++;
+    m_rdmDiscTimer->start(30);   // 等待响应窗口后进入下一步
+}
+
+void ArtNetRecorderMainWindow::rdmFinishDiscovery() {
+    m_rdmDiscRunning = false;
+    if (m_rdmDiscTimer) m_rdmDiscTimer->stop();
+    if (m_btnRdmScan) {
+        m_btnRdmScan->setEnabled(true);
+        m_btnRdmScan->setText(tr("🔍 发现灯具 (DISC 二分搜索)"));
+    }
+    if (m_lblRdmDevCount) m_lblRdmDevCount->setText(QString::number(m_rdmFoundUids.size()));
+
+    // 填表: UID + 厂商 ID, 其余列由后续 GET 应答更新
+    if (m_tblRdmDevices) {
+        m_tblRdmDevices->setRowCount(int(m_rdmFoundUids.size()));
+        for (int i = 0; i < m_rdmFoundUids.size(); ++i) {
+            const quint64 uid = m_rdmFoundUids[i];
+            const quint16 mfr = quint16((uid >> 40) & 0xFFFF);
+            m_tblRdmDevices->setItem(i, 0, new QTableWidgetItem(rdmUidStr(uid)));
+            m_tblRdmDevices->setItem(i, 1,
+                new QTableWidgetItem(QString("0x%1").arg(mfr, 4, 16, QChar('0')).toUpper()));
+            m_tblRdmDevices->setItem(i, 2, new QTableWidgetItem("--"));
+            m_tblRdmDevices->setItem(i, 3, new QTableWidgetItem("--"));
+            m_tblRdmDevices->setItem(i, 4, new QTableWidgetItem("--"));
+        }
+    }
+    rdmRefreshUidCombo();
+    appendLog(tr("RDM 发现完成: %1 台设备 (%2 次 DISC 请求)")
+                  .arg(m_rdmFoundUids.size()).arg(m_rdmDiscSends), "info");
+    if (m_lblRdmOpResult)
+        m_lblRdmOpResult->setText(tr("发现 %1 台灯具, 开始查询地址/故障/设备信息…")
+                                      .arg(m_rdmFoundUids.size()));
+
+    // 逐设备排队 GET: 地址 → 故障 → 设备信息 (种类)
+    for (quint64 uid : m_rdmFoundUids)
+        rdmEnqueueQueries(uid, { kPidDmx512Address, kPidStatusMessages, kPidDeviceInfo });
+    if (!m_rdmQueryQueue.isEmpty()) rdmQueryStep();
+    else if (m_lblRdmOpResult)
+        m_lblRdmOpResult->setText(tr("未发现灯具 (无 RDM 响应或网关不支持 DISC)"));
+}
+
+// ---- 逐设备 GET 查询队列 ----
+void ArtNetRecorderMainWindow::rdmEnqueueQueries(quint64 uid, const QVector<quint16> &pids) {
+    for (quint16 pid : pids) m_rdmQueryQueue.append({ uid, pid });
+}
+
+void ArtNetRecorderMainWindow::rdmQueryStep() {
+    if (m_rdmQueryQueue.isEmpty()) {
+        if (m_lblRdmOpResult)
+            m_lblRdmOpResult->setText(tr("查询完成"));
+        return;
+    }
+    if (!m_rdmListening) startRdmTestRx();
+    const RdmQueryJob job = m_rdmQueryQueue.takeFirst();
+    rdmSendRequest(job.uid, kCcGet, job.pid);
+    if (m_rdmQueryTimer) m_rdmQueryTimer->start(60);
+}
+
+// ---- 常规应答解析: 更新设备表 / 操作结果 ----
+void ArtNetRecorderMainWindow::rdmHandleResponse(const uchar *r, int payloadSize) {
+    const quint64 srcUid = rdmParseUid(r + 10);
+    const quint8 cc = r[21];
+    const quint16 pid = quint16((r[22] << 8) | r[23]);
+    const int pdl = qMin(int(r[24]), payloadSize - 25);
+    const QByteArray params(reinterpret_cast<const char*>(r + 25), pdl);
+    const int row = rdmDeviceRow(srcUid);
+
+    if (pid == kPidDmx512Address) {
+        if (pdl >= 2 && (cc == kCcGetAck || cc == kCcSetAck) && row >= 0) {
+            const quint16 addr = quint16((uchar(params[0]) << 8) | uchar(params[1]));
+            if (m_tblRdmDevices->item(row, 3))
+                m_tblRdmDevices->item(row, 3)->setText(QString::number(addr));
+            if (cc == kCcSetAck && m_lblRdmOpResult)
+                m_lblRdmOpResult->setText(tr("SET 地址成功: %1 → %2")
+                                              .arg(rdmUidStr(srcUid)).arg(addr));
+        } else if (cc == kCcSetNak && m_lblRdmOpResult) {
+            m_lblRdmOpResult->setText(tr("<span style='color:#ff5050'>SET 地址被拒绝 (NACK): %1</span>")
+                                          .arg(rdmUidStr(srcUid)));
+        }
+    } else if (pid == kPidStatusMessages) {
+        QString text;
+        if (cc == kCcGetNak) {
+            text = tr("NACK (不支持)");
+        } else if (pdl == 0) {
+            text = tr("无故障");
+        } else {
+            // 记录长度自适应: 7 字节 (type+id+v1+v2) 或 3 字节 (type+id), 否则原始 HEX
+            const int rec = (pdl % 7 == 0) ? 7 : (pdl % 3 == 0 ? 3 : 0);
+            QStringList parts;
+            if (rec > 0) {
+                for (int off = 0; off + rec <= pdl; off += rec) {
+                    const quint8 stype = uchar(params[off]);
+                    const quint16 mid = quint16((uchar(params[off + 1]) << 8) | uchar(params[off + 2]));
+                    parts << tr("类型0x%1/消息0x%2")
+                                .arg(stype, 2, 16, QChar('0'))
+                                .arg(mid, 4, 16, QChar('0'));
+                }
+            } else {
+                parts << QString(params.toHex(' ').toUpper());
+            }
+            text = parts.join(", ");
+        }
+        if (row >= 0 && m_tblRdmDevices->item(row, 4))
+            m_tblRdmDevices->item(row, 4)->setText(text);
+        if (m_lblRdmOpResult && m_rdmQueryQueue.isEmpty())
+            m_lblRdmOpResult->setText(tr("故障查询 %1: %2").arg(rdmUidStr(srcUid), text));
+    } else if (pid == kPidDeviceInfo && cc == kCcGetAck && pdl >= 4 && row >= 0) {
+        // DEVICE_INFO 应答: [0]主版本 [1]次版本 [2-3]子设备数 [4]端口数 [5-6]footprint [7-8]persona
+        const quint16 devCount = quint16((uchar(params[2]) << 8) | uchar(params[3]));
+        QString info = tr("%1.%2 / %3 子设备")
+                           .arg(uchar(params[0])).arg(uchar(params[1])).arg(devCount);
+        if (pdl >= 7) {
+            const quint16 fp = quint16((uchar(params[5]) << 8) | uchar(params[6]));
+            info += tr(" / %1 槽") .arg(fp);
+        }
+        if (m_tblRdmDevices->item(row, 2))
+            m_tblRdmDevices->item(row, 2)->setText(info);
+    }
 }
 
 // ============================================================
@@ -3123,10 +4164,23 @@ void ArtNetRecorderMainWindow::startArtToDmx() {
     }
     connect(m_brSocket, &QUdpSocket::readyRead, this, [this]{ onArtToDmxDatagram(); });
 
+    // 统一发送节拍: 与网络包到达解耦, 每 tick 批量非阻塞写全部脏端口,
+    // 使各路 BREAK 起始偏差控制在一帧写入耗时内 (~1ms), 而非串行 flush 的 ~21ms/路
+    if (!m_brTickTimer) {
+        m_brTickTimer = new QTimer(this);
+        connect(m_brTickTimer, &QTimer::timeout, this, [this]{ tickArtToDmxBatch(); });
+    }
+    m_brTickTimer->start(23);   // ~43Hz, 大于 DMX 帧时长 20.7ms 留余量
+
     m_brRxCount = m_brDropCount = 0;
     m_brLastLatencyUs = 0;
     m_brLastUni = 0;
     m_brLastDmx.clear();
+    for (int i = 0; i < kArtToDmxOuts; ++i) {
+        m_brOuts[i].dirty = false;
+        m_brOuts[i].frame.clear();
+        m_brOuts[i].arrivedUs = 0;
+    }
 
     m_btnBrToggle->setText(tr("■ 停止转换"));
     m_lblBrState->setText(tr("<span style='color:#00e676'>转换中</span> "
@@ -3137,6 +4191,7 @@ void ArtNetRecorderMainWindow::startArtToDmx() {
 }
 
 void ArtNetRecorderMainWindow::stopArtToDmx() {
+    if (m_brTickTimer) m_brTickTimer->stop();
     if (m_brSocket) {
         m_brSocket->close();
         m_brSocket->deleteLater();
@@ -3180,22 +4235,41 @@ void ArtNetRecorderMainWindow::onArtToDmxDatagram() {
         if (m_brLastDmx.size() < 512)
             m_brLastDmx.append(QByteArray(512 - m_brLastDmx.size(), 0));
 
-        // 路由: 第一个 启用 && sender 已打开 && universe ∈ [起始, 起始+覆盖数) 的行
-        Dmx512Sender *target = nullptr;
+        // 路由: 第一个 启用 && sender 已打开 && universe ∈ [起始, 起始+覆盖数) 的行;
+        // 只更新该行的帧缓存并置脏, 实际发送交给统一节拍 tickArtToDmxBatch
+        int targetIdx = -1;
         for (int i = 0; i < kArtToDmxOuts; ++i) {
             ArtToDmxOutput &row = m_brOuts[i];
             if (!row.chkEnabled || !row.chkEnabled->isChecked()
                 || !row.sender || !row.sender->isOpen()) continue;
             const int start = row.spinStart ? row.spinStart->value() : 0;
             const int span  = row.spinSpan  ? row.spinSpan->value()  : 1;
-            if (int(uni) >= start && int(uni) < start + span) { target = row.sender; break; }
+            if (int(uni) >= start && int(uni) < start + span) { targetIdx = i; break; }
         }
-        if (!target) { ++m_brDropCount; continue; }
+        if (targetIdx < 0) { ++m_brDropCount; continue; }
 
-        target->sendFrame(m_brLastDmx);
-        m_brLastLatencyUs = QDateTime::currentMSecsSinceEpoch() * 1000 - recvUs;
+        ArtToDmxOutput &row = m_brOuts[targetIdx];
+        row.frame = m_brLastDmx;
+        row.dirty = true;
+        row.arrivedUs = recvUs;
         if (m_brFeedOut && m_brFeedOut->isChecked())
             feedLiveUniverse(false, uni, m_brLastDmx, recvUs);
+    }
+}
+
+// 统一节拍批量发送: 对每个脏行做一次非阻塞 sendFrameAsync, 串口忙 (上一帧未发完)
+// 则保留脏标志下个节拍重试; 同 tick 内连续写 8 口, BREAK 偏差仅为一帧写入耗时
+void ArtNetRecorderMainWindow::tickArtToDmxBatch() {
+    const qint64 nowUs = QDateTime::currentMSecsSinceEpoch() * 1000;
+    for (int i = 0; i < kArtToDmxOuts; ++i) {
+        ArtToDmxOutput &row = m_brOuts[i];
+        if (!row.dirty) continue;
+        if (!row.sender || !row.sender->isOpen()) { row.dirty = false; continue; }
+        if (row.sender->sendFrameAsync(row.frame)) {
+            row.dirty = false;
+            m_brLastLatencyUs = nowUs - row.arrivedUs;
+        }
+        // 忙: 保留 dirty, 下个节拍重试
     }
 }
 
@@ -3207,8 +4281,10 @@ QWidget *ArtNetRecorderMainWindow::buildPageArtToDmx() {
 
     auto *hint = new QLabel(tr("Art-Net → DMX512 转换测试 — 监听 ArtDMX 数据报, 支持最多 8 路 DMX 串口输出; "
                                "每行按「起始 Universe + 覆盖域数」划分域段, 收到帧后路由到第一个匹配段所属串口 "
-                               "(同一帧只发一路, 不匹配任何启用段的帧计入丢弃). BREAK/MAB 由发送器按 250000 8N2 "
-                               "标准自动处理. 可用本机「Art-Net 测试」页发送数据来自环验证."));
+                               "(同一帧只发一路, 不匹配任何启用段的帧计入丢弃). 发送采用统一节拍批量非阻塞模式: "
+                               "收包只更新各串口帧缓存, 23ms 定时器 (~43Hz) 一次性把全部脏串口异步写出, "
+                               "8 路 BREAK 起始偏差约 1ms 内, 与网络包到达时刻解耦. BREAK/MAB 由发送器按 "
+                               "250000 8N2 标准自动处理. 可用本机「Art-Net 测试」页发送数据来自环验证."));
     hint->setWordWrap(true);
     hint->setStyleSheet("color:#8fb3d9; font-size:12px;");
     root->addWidget(hint);
@@ -3327,8 +4403,8 @@ QWidget *ArtNetRecorderMainWindow::buildPageArtToDmx() {
     root->addWidget(createCard(tr("转换结果"), statBody), 0);
     root->addStretch();
 
-    m_brStatTimer = new QTimer(this);
-    connect(m_brStatTimer, &QTimer::timeout, this, [this]{
+    // 转换结果统计交给调度器统计组 (仅本页可见时执行)
+    addStatTask(page, [this]{
         quint64 totalTx = 0;
         for (int i = 0; i < kArtToDmxOuts; ++i) {
             const quint64 sent = m_brOuts[i].sender ? m_brOuts[i].sender->totalSentFrames() : 0;
@@ -3348,7 +4424,6 @@ QWidget *ArtNetRecorderMainWindow::buildPageArtToDmx() {
                                                      ? QString::number(uchar(m_brLastDmx.at(0)))
                                                      : "--");
     });
-    m_brStatTimer->start(300);
 
     connect(btnRefresh, &QPushButton::clicked, this, [this]{ refreshArtToDmxPorts(); });
     connect(m_btnBrToggle, &QPushButton::clicked, this, [this]{
@@ -3659,8 +4734,8 @@ QWidget *ArtNetRecorderMainWindow::buildPageDmxToArt() {
     root->addWidget(createCard(tr("转换结果"), statBody), 0);
     root->addStretch();
 
-    m_d2aStatTimer = new QTimer(this);
-    connect(m_d2aStatTimer, &QTimer::timeout, this, [this]{
+    // 转换结果统计交给调度器统计组 (仅本页可见时执行)
+    addStatTask(page, [this]{
         quint64 totalRx = 0;
         for (int i = 0; i < kDmxToArtIns; ++i) {
             totalRx += m_d2aIns[i].rxCount;
@@ -3680,7 +4755,6 @@ QWidget *ArtNetRecorderMainWindow::buildPageDmxToArt() {
                                                       ? QString::number(uchar(m_d2aLastDmx.at(0)))
                                                       : "--");
     });
-    m_d2aStatTimer->start(300);
 
     connect(btnRefresh, &QPushButton::clicked, this, [this]{ refreshD2aPorts(); });
     connect(m_btnD2aToggle, &QPushButton::clicked, this, [this]{
@@ -3786,9 +4860,20 @@ void ArtNetRecorderMainWindow::startNpuToDmx() {
         return;
     }
 
+    // 统一发送节拍: 与 NPU 帧到达解耦, 每 tick 批量非阻塞写全部脏端口
+    if (!m_np2dTickTimer) {
+        m_np2dTickTimer = new QTimer(this);
+        connect(m_np2dTickTimer, &QTimer::timeout, this, [this]{ tickNp2dBatch(); });
+    }
+    m_np2dTickTimer->start(23);   // ~43Hz, 大于 DMX 帧时长 20.7ms 留余量
+
     m_np2dRxCount = m_np2dDropCount = 0;
     m_np2dLastUni = 0;
     m_np2dLastDmx.clear();
+    for (int i = 0; i < kNp2dOuts; ++i) {
+        m_np2dOuts[i].dirty = false;
+        m_np2dOuts[i].frame.clear();
+    }
 
     m_btnNp2dToggle->setText(tr("■ 停止转换"));
     m_lblNp2dState->setText(tr("<span style='color:#00e676'>转换中</span> "
@@ -3800,6 +4885,7 @@ void ArtNetRecorderMainWindow::startNpuToDmx() {
 }
 
 void ArtNetRecorderMainWindow::stopNpuToDmx() {
+    if (m_np2dTickTimer) m_np2dTickTimer->stop();
     if (m_np2dSource) {
         m_np2dSource->stop();
         m_np2dSource->deleteLater();
@@ -3825,22 +4911,37 @@ void ArtNetRecorderMainWindow::onNp2dFrame(const LightFrame &frame) {
     if (m_np2dLastDmx.size() < 512)
         m_np2dLastDmx.append(QByteArray(512 - m_np2dLastDmx.size(), 0));
 
-    // 路由: 第一个 启用 && sender 已打开 && universe ∈ [起始, 起始+覆盖数) 的行
-    Dmx512Sender *target = nullptr;
+    // 路由: 第一个 启用 && sender 已打开 && universe ∈ [起始, 起始+覆盖数) 的行;
+    // 只更新该行的帧缓存并置脏, 实际发送交给统一节拍 tickNp2dBatch
+    int targetIdx = -1;
     for (int i = 0; i < kNp2dOuts; ++i) {
         Np2dOutput &row = m_np2dOuts[i];
         if (!row.chkEnabled || !row.chkEnabled->isChecked()
             || !row.sender || !row.sender->isOpen()) continue;
         const int start = row.spinStart ? row.spinStart->value() : 0;
         const int span  = row.spinSpan  ? row.spinSpan->value()  : 1;
-        if (uni >= start && uni < start + span) { target = row.sender; break; }
+        if (uni >= start && uni < start + span) { targetIdx = i; break; }
     }
-    if (!target) { ++m_np2dDropCount; return; }
+    if (targetIdx < 0) { ++m_np2dDropCount; return; }
 
-    target->sendFrame(m_np2dLastDmx);
+    Np2dOutput &row = m_np2dOuts[targetIdx];
+    row.frame = m_np2dLastDmx;
+    row.dirty = true;
     if (m_np2dFeedOut && m_np2dFeedOut->isChecked())
         feedLiveUniverse(false, quint16(uni), m_np2dLastDmx,
                          QDateTime::currentMSecsSinceEpoch() * 1000);
+}
+
+// 统一节拍批量发送: 对每个脏行做一次非阻塞 sendFrameAsync, 串口忙则保留脏标志下个节拍重试
+void ArtNetRecorderMainWindow::tickNp2dBatch() {
+    for (int i = 0; i < kNp2dOuts; ++i) {
+        Np2dOutput &row = m_np2dOuts[i];
+        if (!row.dirty) continue;
+        if (!row.sender || !row.sender->isOpen()) { row.dirty = false; continue; }
+        if (row.sender->sendFrameAsync(row.frame))
+            row.dirty = false;
+        // 忙: 保留 dirty, 下个节拍重试
+    }
 }
 
 QWidget *ArtNetRecorderMainWindow::buildPageNpuToDmx() {
@@ -3852,6 +4953,8 @@ QWidget *ArtNetRecorderMainWindow::buildPageNpuToDmx() {
     auto *hint = new QLabel(tr("NPU → DMX512 转换测试 — 监听 MA NPU (Ma-Net2) DMX 数据包 (单播/广播, 默认 UDP 9999), "
                                "支持最多 8 路 DMX 串口输出; 每行按「起始 Universe (0..255) + 覆盖域数」划分域段, "
                                "收到帧后路由到第一个匹配段所属串口 (同一帧只发一路, 不匹配任何启用段的帧计入丢弃). "
+                               "发送采用统一节拍批量非阻塞模式: 收帧只更新各串口帧缓存, 23ms 定时器 (~43Hz) "
+                               "一次性把全部脏串口异步写出, 8 路 BREAK 起始偏差约 1ms 内. "
                                "BREAK/MAB 由发送器按 250000 8N2 标准自动处理."));
     hint->setWordWrap(true);
     hint->setStyleSheet("color:#8fb3d9; font-size:12px;");
@@ -3963,8 +5066,8 @@ QWidget *ArtNetRecorderMainWindow::buildPageNpuToDmx() {
     root->addWidget(createCard(tr("转换结果"), statBody), 0);
     root->addStretch();
 
-    m_np2dStatTimer = new QTimer(this);
-    connect(m_np2dStatTimer, &QTimer::timeout, this, [this]{
+    // 转换结果统计交给调度器统计组 (仅本页可见时执行)
+    addStatTask(page, [this]{
         quint64 totalTx = 0;
         for (int i = 0; i < kNp2dOuts; ++i) {
             const quint64 sent = m_np2dOuts[i].sender ? m_np2dOuts[i].sender->totalSentFrames() : 0;
@@ -3981,7 +5084,6 @@ QWidget *ArtNetRecorderMainWindow::buildPageNpuToDmx() {
                                                         ? QString::number(uchar(m_np2dLastDmx.at(0)))
                                                         : "--");
     });
-    m_np2dStatTimer->start(300);
 
     connect(btnRefresh, &QPushButton::clicked, this, [this]{ refreshNp2dPorts(); });
     connect(m_btnNp2dToggle, &QPushButton::clicked, this, [this]{
@@ -4144,13 +5246,9 @@ QWidget *ArtNetRecorderMainWindow::buildPageDmxTest() {
     root->addWidget(createCard(tr("测试结果 (环回 / 时序)"), statBody), 0);
     root->addStretch();
 
-    // ---- 定时器与信号 ----
-    m_dmxTxTimer = new QTimer(this);
-    connect(m_dmxTxTimer, &QTimer::timeout, this, [this]{ writeDmxTestFrame(); });
-
-    m_dmxStatTimer = new QTimer(this);
-    connect(m_dmxStatTimer, &QTimer::timeout, this, [this]{ updateDmxTestStats(); });
-    m_dmxStatTimer->start(300);
+    // ---- 定时任务 (周期发送/统计刷新统一交给分组时间片调度器) ----
+    m_dmxTxTaskId = addStreamTask(page, [this]{ writeDmxTestFrame(); });
+    addStatTask(page, [this]{ updateDmxTestStats(); });
 
     connect(btnRefresh, &QPushButton::clicked, this, [this]{ refreshDmxTestPorts(); });
     connect(m_btnDmxTx, &QPushButton::clicked, this, [this]{

@@ -47,6 +47,8 @@ class MediaPlayerPanel;
 #include <QTabWidget>
 #include <QMap>
 #include <QHash>
+#include <QVector>
+#include <functional>
 
 class QSerialPort;
 class QUdpSocket;
@@ -168,8 +170,8 @@ struct NetTestPage {
     // 运行时
     QUdpSocket  *txSocket      = nullptr;
     QUdpSocket  *rxSocket      = nullptr;
-    QTimer      *txTimer       = nullptr;
-    QTimer      *statTimer     = nullptr;
+    int          txTaskId      = -1;       // 调度器流任务 id (周期发送帧)
+    int          statTaskId    = -1;       // 调度器统计任务 id (300ms 刷新)
     QByteArray   txBuf;                    // 当前发送的 512 通道
     QByteArray   rxAccum;                  // 接收累积缓冲
     QByteArray   cid;                      // sACN 源 CID
@@ -335,7 +337,6 @@ private:
     QLabel      *m_lblRdmHex        = nullptr;
     QUdpSocket  *m_rdmTestTxSock    = nullptr;
     QUdpSocket  *m_rdmTestRxSock    = nullptr;
-    QTimer      *m_rdmTestStatTimer = nullptr;
     quint64      m_rdmTxCount       = 0;
     quint64      m_rdmRxCount       = 0;
     quint64      m_rdmOtherCount    = 0;
@@ -343,6 +344,85 @@ private:
     qint64       m_rdmRespIntervalUs= 0;
     bool         m_rdmListening     = false;
     QByteArray   m_rdmLastPayload;
+
+    // ---- RDM 设备管理扩展: 发现 / 改地址 / 故障查询 (ArtRDM 0x6000) ----
+    QTableWidget *m_tblRdmDevices   = nullptr;   // 发现的灯具列表
+    QLabel      *m_lblRdmDevCount   = nullptr;
+    QComboBox   *m_cmbRdmUid        = nullptr;   // 选中灯具 UID
+    QSpinBox    *m_spinRdmAddr      = nullptr;   // 新 DMX 地址
+    QPushButton *m_btnRdmScan       = nullptr;
+    QPushButton *m_btnRdmSetAddr    = nullptr;
+    QPushButton *m_btnRdmStatus     = nullptr;
+    QPushButton *m_btnRdmStatusAll  = nullptr;
+    QLabel      *m_lblRdmOpResult   = nullptr;
+    QTimer      *m_rdmDiscTimer     = nullptr;   // 发现二分搜索步进
+    QTimer      *m_rdmQueryTimer    = nullptr;   // 逐设备查询步进
+
+    struct RdmUidRange { quint64 lower; quint64 upper; };
+    QVector<RdmUidRange> m_rdmDiscStack;         // 待搜索 UID 区间栈
+    QVector<quint64>     m_rdmDiscHits;          // 本轮 DISC 响应命中 UID
+    QVector<quint64>     m_rdmFoundUids;         // 已确认设备 UID
+    quint64 m_rdmDiscLower = 0;                  // 当前查询区间下界
+    quint64 m_rdmDiscUpper = 0;                  // 当前查询区间上界
+    int     m_rdmDiscSends = 0;                  // 本轮已发送 DISC 请求数
+    bool    m_rdmDiscRunning = false;
+
+    struct RdmQueryJob { quint64 uid; quint16 pid; };
+    QVector<RdmQueryJob> m_rdmQueryQueue;        // 待执行的 GET 请求队列
+    quint8  m_rdmTransaction = 0;                // 事务号 (0..255 循环)
+
+    bool   ensureRdmTxSock();                    // 懒创建发送 socket
+    void   rdmSendRequest(quint64 destUid, quint8 cc, quint16 pid,
+                          const QByteArray &params = QByteArray());
+    void   rdmStartDiscovery();                  // 开始二分发现
+    void   rdmDiscoveryStep();                   // 一步: 发送/判定/分裂
+    void   rdmFinishDiscovery();                 // 发现结束: 填表+排队查询
+    void   rdmEnqueueQueries(quint64 uid, const QVector<quint16> &pids);
+    void   rdmQueryStep();                       // 执行队列中下一个 GET
+    void   rdmHandleResponse(const uchar *r, int payloadSize); // 解析应答并更新表
+    void   rdmRefreshUidCombo();
+    int    rdmDeviceRow(quint64 uid) const;      // UID → 表行号
+    static QString rdmUidStr(quint64 uid);       // 48bit UID → "xx:xx:.."
+    static quint64 rdmParseUid(const uchar *p);  // 6 字节 → 48bit UID
+
+    // ---- RDM 串口传输 (DMX512 线 E1.20 格式, 半双工) ----
+    void   onRdmSerialRx();                      // 串口收包组帧 → 归一化后统一处理
+    void   rdmProcessResponse(const uchar *r, int size); // ArtRDM 布局应答统一处理
+    bool   rdmSerialOpen();                       // 按当前选择打开 RDM 串口 (读写)
+    void   refreshRdmSerialPorts();               // 刷新串口下拉
+
+    // ---- RDM 接收测试 (模拟灯具应答器: 被动收请求并自动应答) ----
+    void   startRdmResponder();
+    void   stopRdmResponder();
+    void   onRdmReqRx();                          // UDP: 接收 ArtRDM 请求
+    bool   rdmHandleRequest(const uchar *r, int size, bool viaSerial,
+                           const QHostAddress &peer);  // 解析请求+自动应答, 返回是否已处理
+    QByteArray rdmFixtureResponse(quint8 cc, quint16 pid, const QByteArray &params,
+                                  quint64 destUid, quint8 txn, quint8 sub); // ArtRDM 布局应答
+    static QByteArray rdmWireFrame(quint8 startCode, quint64 destUid, quint64 srcUid,
+                                   quint8 cc, quint16 pid, const QByteArray &params); // E1.20 线上帧
+    quint64 rdmFixtureUid() const;                // 解析模拟灯具 UID 输入
+    static void rdmMaskedUid(quint64 uid, uchar *out12); // UID → 12 字节奇偶掩码
+
+    QComboBox    *m_cmbRdmTransport = nullptr;   // 0=ArtRDM UDP / 1=DMX512 串口
+    QComboBox    *m_cmbRdmSerial    = nullptr;   // RDM 串口选择
+    QPushButton  *m_btnRdmSerialRefresh = nullptr;
+    Dmx512Sender *m_rdmSerialSender = nullptr;   // 串口传输实例 (读写模式)
+    QByteArray    m_rdmRxAccum;                  // 串口接收组帧缓冲
+
+    QUdpSocket   *m_rdmReqSock = nullptr;        // 应答器监听 socket
+    bool          m_rdmRespActive = false;       // 应答器运行中
+    quint64       m_rdmReqCount = 0;             // 收到请求数
+    quint64       m_rdmRespSent = 0;             // 自动应答数
+    QSpinBox     *m_spinRdmRespPort = nullptr;   // 应答器监听端口
+    QLineEdit    *m_editRdmFixUid = nullptr;     // 模拟灯具 UID (hex)
+    QSpinBox     *m_spinRdmFixAddr = nullptr;    // 模拟灯具 DMX 地址
+    QPushButton  *m_btnRdmResp = nullptr;
+    QLabel       *m_lblRdmRespState = nullptr;
+    QLabel       *m_lblRdmReqCount = nullptr;
+    QLabel       *m_lblRdmRespSent = nullptr;
+    QLabel       *m_lblRdmReqInfo = nullptr;
+    QLabel       *m_lblRdmReqHex = nullptr;
 
     // ===== 页面: Art-Net / NPU 收发测试 =====
     QWidget *buildPageNetTest(ProtocolType type);
@@ -393,8 +473,7 @@ private:
     QLabel      *m_lblDmxTxBytes  = nullptr;   // 实际写入串口的字节数
     QSerialPort *m_dmxTxSerial   = nullptr;
     QSerialPort *m_dmxRxSerial   = nullptr;
-    QTimer      *m_dmxTxTimer    = nullptr;
-    QTimer      *m_dmxStatTimer  = nullptr;
+    int          m_dmxTxTaskId   = -1;      // 调度器流任务 id (周期发送 DMX 帧)
     QByteArray   m_dmxTxBuf;               // 当前发送的 512 通道
     QByteArray   m_dmxRxAccum;             // 接收累积缓冲
     QByteArray   m_dmxRxRaw;               // 最近 64 字节原始接收 (诊断用)
@@ -415,6 +494,7 @@ private:
     void startArtToDmx();
     void stopArtToDmx();
     void onArtToDmxDatagram();
+    void tickArtToDmxBatch();   // 统一节拍: 批量非阻塞写全部脏端口
 
     enum { kArtToDmxOuts = 8 };
     // 每路输出: 启用 + 串口 + 起始 Universe + 覆盖域数, 运行期各自持有 Dmx512Sender
@@ -425,6 +505,9 @@ private:
         QSpinBox     *spinSpan   = nullptr;
         QLabel       *lblSent    = nullptr;
         Dmx512Sender *sender     = nullptr;   // 未启动时为 nullptr
+        QByteArray    frame;                  // 最新待发送 512 通道 (收到包只更新缓存)
+        bool          dirty = false;          // 有新数据待节拍发送
+        qint64        arrivedUs = 0;          // 帧到达时刻 (ms*1000, 延迟统计)
     };
 
     QLineEdit   *m_brListenIp   = nullptr;   // 绑定接收 Art-Net 包的本地 IP
@@ -439,7 +522,7 @@ private:
     QLabel      *m_lblBrLatency  = nullptr;
     QLabel      *m_lblBrCh1      = nullptr;
     QUdpSocket  *m_brSocket      = nullptr;
-    QTimer      *m_brStatTimer   = nullptr;
+    QTimer      *m_brTickTimer   = nullptr;   // 23ms 统一发送节拍 (~43Hz)
     ArtToDmxOutput m_brOuts[kArtToDmxOuts];
     quint64      m_brRxCount     = 0;
     quint64      m_brDropCount   = 0;
@@ -482,7 +565,6 @@ private:
     QLabel      *m_lblD2aLatency = nullptr;
     QLabel      *m_lblD2aCh1     = nullptr;
     QUdpSocket  *m_d2aSocket     = nullptr;
-    QTimer      *m_d2aStatTimer  = nullptr;
     DmxToArtInput m_d2aIns[kDmxToArtIns];
     QByteArray   m_d2aLastDmx;
     quint64      m_d2aTxCount    = 0;
@@ -496,6 +578,7 @@ private:
     void startNpuToDmx();
     void stopNpuToDmx();
     void onNp2dFrame(const LightFrame &frame);
+    void tickNp2dBatch();       // 统一节拍: 批量非阻塞写全部脏端口
 
     enum { kNp2dOuts = 8 };
     // 每路输出: 启用 + 串口 + 起始 Universe(0..255) + 覆盖域数, 运行期各自持有 Dmx512Sender
@@ -506,6 +589,8 @@ private:
         QSpinBox     *spinSpan   = nullptr;
         QLabel       *lblSent    = nullptr;
         Dmx512Sender *sender     = nullptr;   // 未启动时为 nullptr
+        QByteArray    frame;                  // 最新待发送 512 通道 (收到帧只更新缓存)
+        bool          dirty = false;          // 有新数据待节拍发送
     };
 
     QLineEdit   *m_np2dListenIp   = nullptr;
@@ -519,7 +604,7 @@ private:
     QLabel      *m_lblNp2dLastUni = nullptr;
     QLabel      *m_lblNp2dCh1     = nullptr;
     NpuSource   *m_np2dSource     = nullptr;   // 复用生产 NPU 接收路径
-    QTimer      *m_np2dStatTimer  = nullptr;
+    QTimer      *m_np2dTickTimer  = nullptr;   // 23ms 统一发送节拍 (~43Hz)
     Np2dOutput   m_np2dOuts[kNp2dOuts];
     quint64      m_np2dRxCount    = 0;
     quint64      m_np2dDropCount  = 0;
@@ -637,6 +722,46 @@ private:
     int   m_tickCount       = 0;
     int   m_dmxPacketCount  = 0;
     qint64 m_startWallUs    = 0;
+
+    // ===== 分组时间片任务调度器 =====
+    // 各测试页的周期发送/统计刷新不再各挂一个 QTimer, 统一由两个 master timer 驱动:
+    //   流组 5ms 精确时间片 (周期发送), 统计组 300ms (仅当前可见页)
+    // pageId 归属 QStackedWidget 页; 切页时离开页的流任务置 Paused, 回页恢复
+    enum { kPageAlways = -1, kPagePending = -2 };   // -1 总是运行 / -2 待解析页索引
+    struct StreamTask {
+        enum State { Idle, Running, Paused, Finished };
+        State  state      = Idle;
+        int    periodMs   = 0;        // 任务自身周期 (如 25ms = 40fps)
+        qint64 deadlineMs = -1;       // -1 无限运行; >0 累计运行时长到达后自动结束
+        qint64 accMs      = 0;        // 距上次触发的累计毫秒
+        qint64 runMs      = 0;        // 累计运行毫秒 (deadlineMs 原子结束判定用)
+        int    pageId     = kPageAlways;
+        QWidget *page     = nullptr;  // 注册时页面尚未入栈, 首次 tick 延迟解析 pageId
+        std::function<void()> onTick;
+        std::function<void()> onFinished;
+    };
+    struct StatTask {
+        int pageId = kPageAlways;
+        QWidget *page = nullptr;
+        std::function<void()> onTick;
+    };
+
+    // 注册接口: page 传页面顶层 widget (构建期入栈前), nullptr = 总是运行
+    int  addStreamTask(QWidget *page, std::function<void()> onTick,
+                       qint64 deadlineMs = -1, std::function<void()> onFinished = nullptr);
+    int  addStatTask(QWidget *page, std::function<void()> onTick);
+    void startStreamTask(int id, int periodMs);   // 置 Running, 按当前帧率重设周期并清零累计
+    void stopStreamTask(int id);                  // 置 Idle
+    void removeTasksOfPage(QWidget *page);        // 页销毁时移除其全部任务 (会使其余 id 失效, 慎用)
+    void onSchedStreamTick();                     // 流组 master tick
+    void onSchedStatTick();                       // 统计组 master tick
+    void onSchedPageChanged(int cur);             // 切页暂停/恢复流任务
+
+    QVector<StreamTask> m_streamTasks;
+    QVector<StatTask>   m_statTasks;
+    QTimer *m_schedStreamTimer = nullptr;         // 流组: 5ms Qt::PreciseTimer
+    QTimer *m_schedStatTimer   = nullptr;         // 统计组: 300ms
+    int     m_schedCurPage     = 0;               // 当前页索引 (切页暂停用)
 
     QTimer *m_uiTimer = nullptr;
     QLabel *m_lblTopClock = nullptr;

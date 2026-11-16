@@ -5,6 +5,7 @@
 #include "../core/Common.h"
 #include <QObject>
 #include <QSerialPort>
+#include <QElapsedTimer>
 #include <QList>
 #include <QMutex>
 
@@ -52,7 +53,38 @@ public:
      * @brief 发送 DMX512 帧 (原始字节数组, 必须恰好 513 字节含 start code)
      */
     bool sendRaw(const QByteArray &data);
-    
+
+    /**
+     * @brief 非阻塞发送完整 DMX512 帧
+     *
+     * 与 sendFrame 的区别: write 后不 flush, 字节进入驱动 TX 队列由硬件异步发出,
+     * 调用立即返回 (~0.1ms)。多端口可在一个节拍内连续触发, BREAK 起始偏差 ~ms 级。
+     * 上一帧仍在传输 (距上次发送 < 一帧时长) 时直接拒绝, 避免 BREAK 插进帧中间。
+     *
+     * @return 成功入队返回 true; 忙 (上一帧未发完) 或失败返回 false
+     */
+    bool sendFrameAsync(const QByteArray &channels);
+
+    /**
+     * @brief 以读+写模式打开串口 (RDM 半双工: 同一端口发请求、收应答)
+     */
+    bool openRdm(const QString &portName, qint32 baudRate = 250000);
+
+    /**
+     * @brief 发送 E1.20 RDM 线上帧 (含起始码/长度/校验和的完整 DMX 包)
+     *
+     * BREAK + MAB + 原始字节 + flush (RDM 为一次性请求, 必须确保字节上线
+     * 后再进入应答接收窗口)。
+     * @param packet  完整线上帧
+     * @param breakUs BREAK 时长: 常规 RDM (0xCC) 用 100, 发现 (0xFF) 规范要求 ≥176
+     */
+    bool sendRdmFrame(const QByteArray &packet, int breakUs = 100);
+
+    /**
+     * @brief 读取接收缓冲区当前可用的全部字节 (RDM 应答)
+     */
+    QByteArray readAvailable();
+
     /**
      * @brief 列出系统可用的串口
      */
@@ -67,19 +99,32 @@ signals:
     void portOpened(const QString &name);
     void portClosed();
     void portError(const QString &error);
-    
+    void rdmDataReady();   // 串口收到数据 (仅 ReadWrite 模式有意义)
+
 private:
     // 构建 DMX512 帧: BREAK + MAB + 0x00 Start Code + 512 channels
     QByteArray buildDmxFrame(const QByteArray &channels);
 
+    // open/openRdm 公共实现: mode = WriteOnly (纯发送) / ReadWrite (RDM 半双工)
+    bool openInternal(const QString &portName, qint32 baudRate, QIODevice::OpenMode mode);
+
     // 关闭并释放串口; 调用方必须已持有 m_mutex, 且不发信号 (避免锁内重入死锁)
     void closeLocked();
-    
+
+    // 发送 BREAK + MAB (硬件优先, 失败降级软件模拟); 调用方必须已持有 m_mutex
+    // 返回 false 仅当软件回退路径写入失败
+    bool sendBreakLocked(int breakUs = 100);
+
+    // 一帧传输时长 (µs): BREAK 100 + MAB 15 + 513 字节 × 40µs/字节 ≈ 20635
+    static constexpr qint64 kFrameUs = 20700;
+
     QSerialPort *m_serial = nullptr;
     QString m_portName;
     QMutex m_mutex;
     quint64 m_framesSent = 0;
     bool m_hwBreakFailed = false;  // 硬件 BREAK 探测失败后置位, 后续直接走软件回退 (open 成功时重置)
+    QElapsedTimer m_txClock;       // 单调时钟, open 成功时启动 (sendFrameAsync 忙判定用)
+    qint64 m_lastFrameStartUs = -1; // 最近一次异步帧入队时刻 (µs); -1 = 无
 };
 
 #endif // DMX512_SENDER_H

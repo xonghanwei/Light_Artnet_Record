@@ -46,6 +46,14 @@ Dmx512Sender::~Dmx512Sender() {
 }
 
 bool Dmx512Sender::open(const QString &portName, qint32 baudRate) {
+    return openInternal(portName, baudRate, QIODevice::WriteOnly);
+}
+
+bool Dmx512Sender::openRdm(const QString &portName, qint32 baudRate) {
+    return openInternal(portName, baudRate, QIODevice::ReadWrite);
+}
+
+bool Dmx512Sender::openInternal(const QString &portName, qint32 baudRate, QIODevice::OpenMode mode) {
     // 信号统一在释放 m_mutex 后发出: 若槽函数回调本类 open/close/sendFrame,
     // 锁内 emit 会因非递归锁死锁
     QString errText;
@@ -55,7 +63,7 @@ bool Dmx512Sender::open(const QString &portName, qint32 baudRate) {
         QMutexLocker locker(&m_mutex);
 
         if (isOpen()) {
-            if (m_portName == portName) return true;
+            if (m_portName == portName && m_serial->openMode() == mode) return true;
             closeLocked();
             closedPrev = true;
         }
@@ -63,7 +71,7 @@ bool Dmx512Sender::open(const QString &portName, qint32 baudRate) {
         m_serial = new QSerialPort(this);
         m_serial->setPortName(portName);
 
-        if (!m_serial->open(QIODevice::WriteOnly)) {
+        if (!m_serial->open(mode)) {
             errText = m_serial->errorString();
             LOG_ERROR(QString("DMX512 串口打开失败: %1 - %2").arg(portName, errText));
             delete m_serial;
@@ -90,7 +98,13 @@ bool Dmx512Sender::open(const QString &portName, qint32 baudRate) {
                 m_portName = portName;
                 m_framesSent = 0;
                 m_hwBreakFailed = false;
-                LOG_INFO(QString("DMX512 串口已打开: %1 @ %2 baud").arg(portName).arg(baudRate));
+                m_txClock.start();
+                m_lastFrameStartUs = -1;
+                // RDM 半双工接收: 仅 ReadWrite 模式实际产生 readyRead
+                connect(m_serial, &QSerialPort::readyRead, this, &Dmx512Sender::rdmDataReady);
+                LOG_INFO(QString("DMX512 串口已打开: %1 @ %2 baud (%3)")
+                             .arg(portName).arg(baudRate)
+                             .arg(mode == QIODevice::ReadWrite ? "读写/RDM" : "只写"));
                 opened = true;
             }
         }
@@ -148,20 +162,14 @@ QByteArray Dmx512Sender::buildDmxFrame(const QByteArray &channels) {
     return frame;
 }
 
-bool Dmx512Sender::sendFrame(const QByteArray &channels) {
-    QMutexLocker locker(&m_mutex);
-    
-    if (!isOpen() || !m_serial) return false;
-    
-    QByteArray frame = buildDmxFrame(channels);
-    
-    // === 发送 BREAK + MAB ===
+// 发送 BREAK + MAB; 调用方必须已持有 m_mutex
+bool Dmx512Sender::sendBreakLocked(int breakUs) {
     // DMX512 要求 BREAK (90±10μs) + MAB (12±2μs)
     // 不同 USB-DMX 设备对 BREAK 的实现支持程度不同
     //
     // 策略: 优先用平台 API 发送硬件 BREAK; 调用失败 (部分驱动不实现 break 控制,
     // 如旧版 ch341) 则记住状态并降级软件模拟, 避免静默发出无 BREAK 的帧
-    
+
     bool hwBreakSent = false;
 #ifdef Q_OS_WIN
     // Windows: 用 EscapeCommFunction 发送硬件 BREAK
@@ -170,7 +178,7 @@ bool Dmx512Sender::sendFrame(const QByteArray &channels) {
         HANDLE handle = m_serial->handle();
         if (handle != INVALID_HANDLE_VALUE) {
             const BOOL setOk = EscapeCommFunction(handle, SETBREAK);
-            preciseDelayUs(100);   // 保持 100μs 低电平
+            preciseDelayUs(breakUs);   // 保持 BREAK 低电平
             const BOOL clrOk = EscapeCommFunction(handle, CLRBREAK);
             if (setOk && clrOk) {
                 hwBreakSent = true;
@@ -189,7 +197,7 @@ bool Dmx512Sender::sendFrame(const QByteArray &channels) {
         int fd = m_serial->handle();
         if (fd >= 0) {
             const bool setOk = (ioctl(fd, TIOCSBRK) == 0);
-            preciseDelayUs(100);   // BREAK
+            preciseDelayUs(breakUs);   // BREAK
             const bool clrOk = (ioctl(fd, TIOCCBRK) == 0);
             if (setOk && clrOk) {
                 hwBreakSent = true;
@@ -209,22 +217,60 @@ bool Dmx512Sender::sendFrame(const QByteArray &channels) {
             LOG_WARN(QString("DMX512 BREAK 回退写入失败: %1").arg(m_serial->errorString()));
             return false;
         }
-        preciseDelayUs(100);
+        preciseDelayUs(breakUs);
     }
-    
+    return true;
+}
+
+bool Dmx512Sender::sendFrame(const QByteArray &channels) {
+    QMutexLocker locker(&m_mutex);
+
+    if (!isOpen() || !m_serial) return false;
+
+    QByteArray frame = buildDmxFrame(channels);
+
+    if (!sendBreakLocked()) return false;
+
     // === 发送 Start Code (0x00) + 512 channels ===
     qint64 written = m_serial->write(frame);
     if (written != frame.size()) {
         LOG_WARN(QString("DMX512 写入不完整: %1/%2").arg(written).arg(frame.size()));
         return false;
     }
-    
+
     // flush 失败通常意味着适配器已被拔出/写错误, 不能静默计入已发送帧数
     if (!m_serial->flush()) {
         LOG_WARN(QString("DMX512 flush 失败: %1").arg(m_serial->errorString()));
         return false;
     }
 
+    m_framesSent++;
+    return true;
+}
+
+bool Dmx512Sender::sendFrameAsync(const QByteArray &channels) {
+    QMutexLocker locker(&m_mutex);
+
+    if (!isOpen() || !m_serial) return false;
+
+    // 忙判定: 上一帧字节仍在驱动 TX 队列/线路上发出时, SETBREAK 会插进帧中间,
+    // 必须拒绝 (调用方保留数据下个节拍重试)
+    const qint64 nowUs = m_txClock.isValid() ? m_txClock.nsecsElapsed() / 1000 : 0;
+    if (m_lastFrameStartUs >= 0 && nowUs - m_lastFrameStartUs < kFrameUs)
+        return false;
+
+    QByteArray frame = buildDmxFrame(channels);
+
+    if (!sendBreakLocked()) return false;
+
+    const qint64 written = m_serial->write(frame);
+    if (written != frame.size()) {
+        LOG_WARN(QString("DMX512 异步写入不完整: %1/%2").arg(written).arg(frame.size()));
+        return false;
+    }
+
+    // 不 flush: 字节留在驱动队列由硬件异步发出, 本调用立即返回
+    m_lastFrameStartUs = nowUs;
     m_framesSent++;
     return true;
 }
@@ -236,6 +282,32 @@ bool Dmx512Sender::sendRaw(const QByteArray &data) {
     qint64 written = m_serial->write(data);
     bool flushed = m_serial->flush();
     return written == data.size() && flushed;
+}
+
+// 发送 E1.20 RDM 线上帧: BREAK + MAB + 完整包 (起始码/长度/头/数据/校验和) + flush.
+// flush 必须: RDM 是一次性请求, 字节全部上线后才能进入应答接收窗口
+bool Dmx512Sender::sendRdmFrame(const QByteArray &packet, int breakUs) {
+    QMutexLocker locker(&m_mutex);
+    if (!isOpen() || !m_serial) return false;
+
+    if (!sendBreakLocked(breakUs)) return false;
+
+    const qint64 written = m_serial->write(packet);
+    if (written != packet.size()) {
+        LOG_WARN(QString("RDM 帧写入不完整: %1/%2").arg(written).arg(packet.size()));
+        return false;
+    }
+    if (!m_serial->flush()) {
+        LOG_WARN(QString("RDM 帧 flush 失败: %1").arg(m_serial->errorString()));
+        return false;
+    }
+    return true;
+}
+
+QByteArray Dmx512Sender::readAvailable() {
+    QMutexLocker locker(&m_mutex);
+    if (!m_serial) return QByteArray();
+    return m_serial->readAll();
 }
 
 QStringList Dmx512Sender::availablePorts() {
