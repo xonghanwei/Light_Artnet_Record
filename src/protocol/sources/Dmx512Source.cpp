@@ -21,17 +21,14 @@ bool Dmx512Source::start(const ConnectionParams &params) {
         return false;
     }
     
+    const qint32 baud = params.serialBaudRate > 0 ? params.serialBaudRate : 250000;
+
     m_serial = new QSerialPort(this);
     m_serial->setPortName(params.serialPortName);
-    m_serial->setBaudRate(params.serialBaudRate > 0 ? params.serialBaudRate : 250000);
-    m_serial->setDataBits(QSerialPort::Data8);
-    m_serial->setParity(QSerialPort::NoParity);
-    m_serial->setStopBits(QSerialPort::TwoStop);
-    m_serial->setFlowControl(QSerialPort::NoFlowControl);
-    
+
     connect(m_serial, &QSerialPort::readyRead,
             this, &Dmx512Source::onReadyRead);
-    
+
     if (!m_serial->open(QIODevice::ReadOnly)) {
         LOG_ERROR(QString("[Dmx512Source] 打开 %1 失败: %2")
             .arg(params.serialPortName, m_serial->errorString()));
@@ -40,7 +37,24 @@ bool Dmx512Source::start(const ConnectionParams &params) {
         m_serial = nullptr;
         return false;
     }
-    
+
+    // 必须在 open 之后应用参数: 端口未打开时 setBaudRate 只缓存并恒返回 true,
+    // 驱动是否支持 250000 (非标准波特率) 要到真正下发时才校验
+    bool paramsOk = m_serial->setBaudRate(baud)
+                    && m_serial->setDataBits(QSerialPort::Data8)
+                    && m_serial->setParity(QSerialPort::NoParity)
+                    && m_serial->setStopBits(QSerialPort::TwoStop)
+                    && m_serial->setFlowControl(QSerialPort::NoFlowControl);
+    if (!paramsOk || m_serial->baudRate() != baud) {
+        LOG_ERROR(QString("[Dmx512Source] 串口不支持 %1 8N2 参数: %2 - %3")
+            .arg(baud).arg(params.serialPortName, m_serial->errorString()));
+        emit errorOccurred(m_serial->errorString());
+        m_serial->close();
+        delete m_serial;
+        m_serial = nullptr;
+        return false;
+    }
+
     m_running = true;
     m_framesReceived = 0;
     m_filterUniverses = params.filterUniverses;

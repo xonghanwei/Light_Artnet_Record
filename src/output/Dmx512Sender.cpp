@@ -2,14 +2,40 @@
 #include "Dmx512Sender.h"
 #include "../core/Logger.h"
 #include <QSerialPortInfo>
-#include <QThread>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
 #else
 #include <unistd.h>
 #include <termios.h>
+#include <sys/ioctl.h>
+#include <time.h>
 #endif
+
+// 微秒级精确延时 (忙等).
+// Windows Sleep/usleep 受系统定时器精度 (~15.6ms) 影响, Linux usleep 有调度抖动,
+// 均无法满足 DMX BREAK(90±10μs)/MAB(12±2μs) 时序, 必须用高分辨率单调时钟计数.
+static void preciseDelayUs(qint64 us) {
+#ifdef Q_OS_WIN
+    LARGE_INTEGER freq, start, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    const LONGLONG target = static_cast<LONGLONG>(freq.QuadPart * static_cast<double>(us) / 1000000.0);
+    do {
+        QueryPerformanceCounter(&now);
+    } while (now.QuadPart - start.QuadPart < target);
+#else
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    const long targetNs = static_cast<long>(us * 1000);
+    long elapsedNs = 0;
+    do {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        elapsedNs = static_cast<long>((now.tv_sec - start.tv_sec) * 1000000000L
+                                      + (now.tv_nsec - start.tv_nsec));
+    } while (elapsedNs < targetNs);
+#endif
+}
 
 Dmx512Sender::Dmx512Sender(QObject *parent)
     : QObject(parent) {
@@ -20,45 +46,78 @@ Dmx512Sender::~Dmx512Sender() {
 }
 
 bool Dmx512Sender::open(const QString &portName, qint32 baudRate) {
-    if (isOpen()) {
-        if (m_portName == portName) return true;
-        close();
+    // 信号统一在释放 m_mutex 后发出: 若槽函数回调本类 open/close/sendFrame,
+    // 锁内 emit 会因非递归锁死锁
+    QString errText;
+    bool opened = false;
+    bool closedPrev = false;
+    {
+        QMutexLocker locker(&m_mutex);
+
+        if (isOpen()) {
+            if (m_portName == portName) return true;
+            closeLocked();
+            closedPrev = true;
+        }
+
+        m_serial = new QSerialPort(this);
+        m_serial->setPortName(portName);
+
+        if (!m_serial->open(QIODevice::WriteOnly)) {
+            errText = m_serial->errorString();
+            LOG_ERROR(QString("DMX512 串口打开失败: %1 - %2").arg(portName, errText));
+            delete m_serial;
+            m_serial = nullptr;
+        } else {
+            // DMX512 标准串口参数: 250000 8N2
+            // 必须在 open 之后应用: 端口未打开时 setBaudRate 只缓存参数并恒返回 true,
+            // 驱动是否支持要到真正下发时才校验。250000 为非标准波特率,
+            // 部分适配器 (某些 CH340/PL2303 驱动) 不支持, 失败必须中止,
+            // 否则会静默按错误波特率发帧 (现象为灯具乱闪/无响应)
+            bool paramsOk = m_serial->setBaudRate(baudRate)
+                            && m_serial->setDataBits(QSerialPort::Data8)
+                            && m_serial->setParity(QSerialPort::NoParity)
+                            && m_serial->setStopBits(QSerialPort::TwoStop)
+                            && m_serial->setFlowControl(QSerialPort::NoFlowControl);
+            if (!paramsOk || m_serial->baudRate() != baudRate) {
+                errText = m_serial->errorString();
+                LOG_ERROR(QString("DMX512 串口不支持 %1 8N2 参数: %2 - %3")
+                              .arg(baudRate).arg(portName, errText));
+                m_serial->close();
+                delete m_serial;
+                m_serial = nullptr;
+            } else {
+                m_portName = portName;
+                m_framesSent = 0;
+                m_hwBreakFailed = false;
+                LOG_INFO(QString("DMX512 串口已打开: %1 @ %2 baud").arg(portName).arg(baudRate));
+                opened = true;
+            }
+        }
     }
-    
-    m_serial = new QSerialPort(this);
-    m_serial->setPortName(portName);
-    
-    // DMX512 标准串口参数: 250000 8N2
-    m_serial->setBaudRate(baudRate);
-    m_serial->setDataBits(QSerialPort::Data8);
-    m_serial->setParity(QSerialPort::NoParity);
-    m_serial->setStopBits(QSerialPort::TwoStop);
-    m_serial->setFlowControl(QSerialPort::NoFlowControl);
-    
-    if (!m_serial->open(QIODevice::WriteOnly)) {
-        QString err = m_serial->errorString();
-        LOG_ERROR(QString("DMX512 串口打开失败: %1 - %2").arg(portName, err));
-        emit portError(err);
-        delete m_serial;
-        m_serial = nullptr;
-        return false;
-    }
-    
-    m_portName = portName;
-    m_framesSent = 0;
-    
-    LOG_INFO(QString("DMX512 串口已打开: %1 @ %2 baud").arg(portName).arg(baudRate));
-    emit portOpened(portName);
-    
-    return true;
+
+    if (closedPrev) emit portClosed();
+    if (opened) emit portOpened(portName);
+    else if (!errText.isEmpty()) emit portError(errText);
+    return opened;
 }
 
 void Dmx512Sender::close() {
-    if (m_serial) {
-        if (m_serial->isOpen()) {
-            m_serial->close();
-            emit portClosed();
+    bool wasOpen = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        if (m_serial) {
+            wasOpen = m_serial->isOpen();
+            closeLocked();
         }
+    }
+    if (wasOpen) emit portClosed();
+}
+
+// 调用方必须已持有 m_mutex
+void Dmx512Sender::closeLocked() {
+    if (m_serial) {
+        if (m_serial->isOpen()) m_serial->close();
         delete m_serial;
         m_serial = nullptr;
     }
@@ -99,37 +158,59 @@ bool Dmx512Sender::sendFrame(const QByteArray &channels) {
     // === 发送 BREAK + MAB ===
     // DMX512 要求 BREAK (90±10μs) + MAB (12±2μs)
     // 不同 USB-DMX 设备对 BREAK 的实现支持程度不同
-    // 
-    // 策略: 优先用平台 API 发送硬件 BREAK, 失败则用软件模拟
+    //
+    // 策略: 优先用平台 API 发送硬件 BREAK; 调用失败 (部分驱动不实现 break 控制,
+    // 如旧版 ch341) 则记住状态并降级软件模拟, 避免静默发出无 BREAK 的帧
     
+    bool hwBreakSent = false;
 #ifdef Q_OS_WIN
     // Windows: 用 EscapeCommFunction 发送硬件 BREAK
-    HANDLE handle = m_serial->handle();
-    if (handle != INVALID_HANDLE_VALUE) {
-        EscapeCommFunction(handle, SETBREAK);
-        QThread::usleep(100);  // 保持 100μs 低电平
-        EscapeCommFunction(handle, CLRBREAK);
-        QThread::usleep(15);   // MAB
-    } else {
-        // 回退: 软件模拟 BREAK
-        // 写 0x00 字节 + 足够长的延时
-        m_serial->write("\x00\x00", 2);
-        QThread::usleep(100);
-        m_serial->flush();
+    // (延时用 QueryPerformanceCounter 忙等, Sleep/usleep 精度 ~15.6ms 不可用)
+    if (!m_hwBreakFailed) {
+        HANDLE handle = m_serial->handle();
+        if (handle != INVALID_HANDLE_VALUE) {
+            const BOOL setOk = EscapeCommFunction(handle, SETBREAK);
+            preciseDelayUs(100);   // 保持 100μs 低电平
+            const BOOL clrOk = EscapeCommFunction(handle, CLRBREAK);
+            if (setOk && clrOk) {
+                hwBreakSent = true;
+                preciseDelayUs(15);    // MAB
+            } else {
+                m_hwBreakFailed = true;
+                LOG_WARN("DMX512 硬件 BREAK 不可用 (EscapeCommFunction 失败), 降级软件模拟 BREAK");
+            }
+        }
     }
 #else
-    // Linux/macOS: 用 tcsetattr 发送 BREAK
-    int fd = m_serial->handle();
-    if (fd >= 0) {
-        // 尝试用 tcflow 或 tcsendbreak
-        tcsendbreak(fd, 0);  // POSIX BREAK
-        QThread::usleep(15); // MAB
-    } else {
-        m_serial->write("\x00\x00", 2);
-        QThread::usleep(100);
-        m_serial->flush();
+    // Linux/macOS: 用 TIOCSBRK/TIOCCBRK ioctl 强制 TX 拉低
+    // (等价于 Windows SETBREAK/CLRBREAK; tcsendbreak(fd,0) 按 POSIX 固定约 0.25s,
+    //  远超 DMX 90μs 规范, 不可用)
+    if (!m_hwBreakFailed) {
+        int fd = m_serial->handle();
+        if (fd >= 0) {
+            const bool setOk = (ioctl(fd, TIOCSBRK) == 0);
+            preciseDelayUs(100);   // BREAK
+            const bool clrOk = (ioctl(fd, TIOCCBRK) == 0);
+            if (setOk && clrOk) {
+                hwBreakSent = true;
+                preciseDelayUs(15);    // MAB
+            } else {
+                m_hwBreakFailed = true;
+                LOG_WARN("DMX512 硬件 BREAK 不可用 (TIOCSBRK/TIOCCBRK 失败), 降级软件模拟 BREAK");
+            }
+        }
     }
 #endif
+    if (!hwBreakSent) {
+        // 回退: 软件模拟 BREAK (注意: 0x00 字节含停止位间隙, 并非连续低电平,
+        // 仅部分接收器可容忍; 优先保证硬件 BREAK 路径)
+        m_serial->write("\x00\x00", 2);
+        if (!m_serial->flush()) {
+            LOG_WARN(QString("DMX512 BREAK 回退写入失败: %1").arg(m_serial->errorString()));
+            return false;
+        }
+        preciseDelayUs(100);
+    }
     
     // === 发送 Start Code (0x00) + 512 channels ===
     qint64 written = m_serial->write(frame);
@@ -138,8 +219,12 @@ bool Dmx512Sender::sendFrame(const QByteArray &channels) {
         return false;
     }
     
-    m_serial->flush();
-    
+    // flush 失败通常意味着适配器已被拔出/写错误, 不能静默计入已发送帧数
+    if (!m_serial->flush()) {
+        LOG_WARN(QString("DMX512 flush 失败: %1").arg(m_serial->errorString()));
+        return false;
+    }
+
     m_framesSent++;
     return true;
 }
@@ -147,10 +232,10 @@ bool Dmx512Sender::sendFrame(const QByteArray &channels) {
 bool Dmx512Sender::sendRaw(const QByteArray &data) {
     QMutexLocker locker(&m_mutex);
     if (!isOpen() || !m_serial) return false;
-    
+
     qint64 written = m_serial->write(data);
-    m_serial->flush();
-    return written == data.size();
+    bool flushed = m_serial->flush();
+    return written == data.size() && flushed;
 }
 
 QStringList Dmx512Sender::availablePorts() {
