@@ -165,6 +165,7 @@ endif()
 option(BUILD_SDK "Build third-party SDK DLL" ON)
 if(BUILD_SDK)
     add_subdirectory(sdk)
+    add_subdirectory(dmx_sdk)
 endif()
 
 # ============================================================

@@ -56,7 +56,9 @@ jobs:
         run: cmake --build ${{ env.BUILD_DIR }} --parallel $env:NUMBER_OF_PROCESSORS
 
       - name: SDK self-test
-        run: .\${{ env.BUILD_DIR }}\bin\artnet_sdk_test.exe
+        run: |
+          .\${{ env.BUILD_DIR }}\bin\artnet_sdk_test.exe
+          .\${{ env.BUILD_DIR }}\bin\dmx512_sdk_test.exe
 
       - name: Test
         working-directory: ${{ env.BUILD_DIR }}
@@ -100,7 +102,10 @@ jobs:
           path: |
             ${{ env.BUILD_DIR }}/bin/artnet_sdk.dll
             ${{ env.BUILD_DIR }}/bin/artnet_sdk.lib
+            ${{ env.BUILD_DIR }}/bin/dmx512_sdk.dll
+            ${{ env.BUILD_DIR }}/bin/dmx512_sdk.lib
             ${{ env.BUILD_DIR }}/bin/artnet_recorder.exe
             sdk/include/ArtNetSdk.h
+            dmx_sdk/include/Dmx512Sdk.h
           if-no-files-found: warn
           retention-days: 7
